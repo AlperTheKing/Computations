@@ -2,10 +2,10 @@ import numpy as np
 import time
 
 # Number of simulations
-num_simulations = 100_000
+num_simulations = 10000
 
 # Number of steps
-num_steps = 100_000
+num_steps = 10000
 
 # Function to run a single simulation
 def run_simulation():
