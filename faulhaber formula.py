@@ -6,7 +6,7 @@ def calculate_term(args):
     k, n, p = args
     binomial_coeff = binomial(p + 1, k)
     bernoulli_num = bernoulli(k)
-    return binomial_coeff * bernoulli_num * (n ** (p + 1 - k))
+    return binomial_coeff * bernoulli_num * (n ** (p + 1 - k)) # type: ignore
 
 def faulhabers_formula(n, p):
     # Prepare arguments for multiprocessing
