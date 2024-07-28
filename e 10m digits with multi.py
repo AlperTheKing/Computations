@@ -11,7 +11,7 @@ def combine_results(results):
     return ''.join(results)
 
 if __name__ == '__main__':
-    num_digits = 100000000  # Adjust the number of digits as required
+    num_digits = 10000000  # Adjust the number of digits as required
     num_processes = mp.cpu_count()
     segment_size = num_digits // num_processes
     precision = num_digits + 10  # Extra precision to handle boundary errors
