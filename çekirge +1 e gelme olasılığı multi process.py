@@ -1,15 +1,16 @@
 import numpy as np
 import multiprocessing
 import time
+import os
 
 # Number of simulations
-num_simulations = 100_0000
+num_simulations = 10000
 
 # Number of steps
-num_steps = 100_000
+num_steps = 10000
 
 # Number of processes (cores) to use
-num_processes = 16
+num_processes = os.cpu_count()
 
 # Number of simulations per process
 simulations_per_process = num_simulations // num_processes
