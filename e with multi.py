@@ -1,59 +1,51 @@
 import sympy
 from mpmath import mp
-import threading
+import multiprocessing as multi
 import time
 
-# e sayısının 10 milyon basamağını hesapla
-mp.dps = 10000001  # Basamak sayısını belirt
-e_str = str(mp.e)[2:]  # '2.' kısmını çıkart
+# Set the number of decimal places for mpmath
+mp.dps = 10000001  # Set precision to 10 million decimal places
+e_str = str(mp.e)[2:]  # Remove the '2.' part from the string representation
 
-# e sayısının ilk 10 milyon basamağını yazdır
-print(f"e'nin ilk 10 milyon basamağı hesaplandı.")
+print(f"Calculated the first 10 million digits of e.")
 
-# 10 basamaklı asal sayıları ve indekslerini saklamak için liste
-prime_indices = []
-lock = threading.Lock()  # Listeye erişimi senkronize etmek için kilit
-
-# Verilen aralıktaki sayının asal olup olmadığını kontrol eden fonksiyon
-def find_primes(start, end):
+# Function to check for primes in a given range
+def find_primes(start, end, return_list):
     local_primes = []
     for i in range(start, end):
         num = e_str[i:i + 10]
         if len(num) == 10 and num[0] != '0' and sympy.isprime(int(num)):
             local_primes.append((i, num))
-    with lock:
-        prime_indices.extend(local_primes)
+    return_list.extend(local_primes)
 
-# Thread fonksiyonu
-def thread_function(start, step):
-    end = min(start + step, len(e_str) - 9)
-    find_primes(start, end)
-
-# Çalışma süresini ölçmek için başlangıç zamanı
+# Measure the start time
 start_time = time.time()
 
-# Multi-threading
-num_threads = 16
-step = len(e_str) // num_threads
-threads = []
+# Multi-processing setup
+num_processes = 48
+step = len(e_str) // num_processes
+manager = multi.Manager()
+return_list = manager.list()
+processes = []
 
-# Threadleri oluştur ve başlat
-for i in range(num_threads):
+# Create and start processes
+for i in range(num_processes):
     start = i * step
-    thread = threading.Thread(target=thread_function, args=(start, step))
-    threads.append(thread)
-    thread.start()
+    end = min(start + step, len(e_str) - 9)
+    process = multi.Process(target=find_primes, args=(start, end, return_list))
+    processes.append(process)
+    process.start()
 
-# Threadlerin bitmesini bekle
-for thread in threads:
-    thread.join()
+# Wait for all processes to complete
+for process in processes:
+    process.join()
 
-# Çalışma süresini ölçmek için bitiş zamanı
+# Measure the end time
 end_time = time.time()
 
-# Bulunan asal sayıları ve indeksleri yazdır
-for index, prime in prime_indices:
+# Print the found primes and their indices
+for index, prime in return_list:
     print(f"Index: {index}, Prime: {prime}")
 
-# Toplam çalışma süresini yazdır
-print(f"Toplam çalışma süresi: {end_time - start_time:.2f} saniye")
+# Print the total execution time
+print(f"Total execution time: {end_time - start_time:.2f} seconds")
