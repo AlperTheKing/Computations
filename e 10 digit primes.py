@@ -25,7 +25,7 @@ def main():
     start_time = time.time()  # Start time measurement
 
     # Multiprocessing setup
-    num_processes = os.cpu_count()
+    num_processes = os.cpu_count() or 1  # Default to 1 if os.cpu_count() returns None
     step = len(e_str) // num_processes
 
     # Create a pool of processes
