@@ -3,18 +3,21 @@ import mpmath
 import time
 
 def compute_e_segment(start, end):
-    return str(mpmath.nstr(mpmath.e, end))[:end][-1*(end-start):]
+    mpmath.mp.dps = end
+    e_str = str(mpmath.nstr(mpmath.e, end))
+    return e_str[start:end]
 
 def combine_results(results):
     return ''.join(results)
 
 if __name__ == '__main__':
-    mpmath.mp.dps = 10000000  # Set decimal places for e
+    num_digits = 100000000  # Adjust the number of digits as required
     num_processes = mp.cpu_count()
-    segment_size = 10000000 // num_processes
-    
+    segment_size = num_digits // num_processes
+    precision = num_digits + 10  # Extra precision to handle boundary errors
+
     start_time = time.time()
-    
+
     with mp.Pool(processes=num_processes) as pool:
         tasks = [(i * segment_size, (i + 1) * segment_size) for i in range(num_processes)]
         results = pool.starmap(compute_e_segment, tasks)
