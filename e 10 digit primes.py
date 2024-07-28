@@ -1,46 +1,47 @@
 import sympy
 from mpmath import mp
-import threading
+import multiprocessing as multip
+import os
+import time
 
-# e sayısının 1000 basamağını hesapla
-mp.dps = 1001  # Basamak sayısını belirt
-e_str = str(mp.e)[2:]  # '2.' kısmını çıkart
+# Calculate the first 100,000 decimal places of e
+mp.dps = 100001  # Set the number of decimal places
+e_str = str(mp.e)[2:]  # Remove the '2.' part
 
-# e sayısının ilk 1000 basamağını yazdır
-print(f"e'nin ilk 1000 basamağı: {e_str}")
+# Print the first 1000 decimal places of e
+print(f"The first 1000 digits of e: {e_str[:1000]}")
 
-# 10 basamaklı asal sayıları ve indekslerini saklamak için liste
-prime_indices = []
-
-# Verilen aralıktaki sayının asal olup olmadığını kontrol eden fonksiyon
+# Function to check for primes in a given range
 def find_primes(start, end):
-    global prime_indices
+    local_primes = []
     for i in range(start, end):
         num = e_str[i:i + 10]
         if len(num) == 10 and sympy.isprime(int(num)):
-            prime_indices.append((i, num))
+            local_primes.append((i, num))
+    return local_primes
 
-# Thread fonksiyonu
-def thread_function(start, step):
-    end = min(start + step, len(e_str) - 9)
-    find_primes(start, end)
+# Main function to handle multiprocessing
+def main():
+    start_time = time.time()  # Start time measurement
 
-# Multi-threading
-num_threads = 16
-step = len(e_str) // num_threads
-threads = []
+    # Multiprocessing setup
+    num_processes = os.cpu_count()
+    step = len(e_str) // num_processes
 
-# Threadleri oluştur ve başlat
-for i in range(num_threads):
-    start = i * step
-    thread = threading.Thread(target=thread_function, args=(start, step))
-    threads.append(thread)
-    thread.start()
+    # Create a pool of processes
+    with multip.Pool(processes=num_processes) as pool:
+        # Distribute the task across the processes
+        results = pool.starmap(find_primes, [(i * step, min((i + 1) * step, len(e_str) - 9)) for i in range(num_processes)])
 
-# Threadlerin bitmesini bekle
-for thread in threads:
-    thread.join()
+    # Combine results from all processes
+    prime_indices = [item for sublist in results for item in sublist]
 
-# Bulunan asal sayıları ve indeksleri yazdır
-for index, prime in prime_indices:
-    print(f"Index: {index}, Prime: {prime}")
+    # Print the found primes and their indices
+    for index, prime in prime_indices:
+        print(f"Index: {index}, Prime: {prime}")
+
+    end_time = time.time()  # End time measurement
+    print(f"Total execution time: {end_time - start_time:.2f} seconds")
+
+if __name__ == "__main__":
+    main()
