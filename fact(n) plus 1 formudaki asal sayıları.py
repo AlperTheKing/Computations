@@ -9,7 +9,7 @@ def is_factorial_plus_one_prime(n):
         return (n, number)
     return None
 
-def parallel_search(limit, num_processes=mp.cpu_count()):
+def parallel_search(limit, num_processes=min (60, mp.cpu_count())):
     """Çoklu çekirdek kullanarak n! + 1 şeklinde ifade edilen asal sayıları arar."""
     with mp.Pool(processes=num_processes) as pool:
         results = pool.map(is_factorial_plus_one_prime, range(1, limit + 1))
