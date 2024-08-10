@@ -1,5 +1,6 @@
 import multiprocessing as mp
 from sympy import factorial, isprime
+import time
 
 def is_factorial_plus_one_prime(n):
     """n! + 1 sayısının asal olup olmadığını kontrol eder."""
@@ -19,10 +20,17 @@ def parallel_search(limit, num_processes=mp.cpu_count()):
 
 if __name__ == "__main__":
     limit = 1000  # Aranacak n değerinin üst sınırı
+    
+    start_time = time.time()  # Başlangıç zamanını al
     primes = parallel_search(limit)
+    end_time = time.time()  # Bitiş zamanını al
+    
+    elapsed_time = end_time - start_time  # Geçen süreyi hesapla
     
     if primes:
         for n, prime in primes:
             print(f"{n}! + 1 = {prime} (asal)")
     else:
         print("Belirtilen aralıkta n! + 1 şeklinde ifade edilebilen asal sayı bulunamadı.")
+    
+    print(f"\nToplam geçen süre: {elapsed_time:.2f} saniye")
