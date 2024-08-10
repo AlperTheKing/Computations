@@ -39,7 +39,7 @@ def find_primes_in_range(start, end, queue):
 # Main function
 def main():
     max_num = 100_000_000
-    num_processes = 48
+    num_processes = 60
     chunk_size = max_num // num_processes
 
     queue = multi.Queue()
