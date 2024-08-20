@@ -23,7 +23,7 @@ if __name__ == '__main__':
     segments = [e_str[i:i + segment_size + 9] for i in range(0, len(e_str) - 9, segment_size)]
 
     # Process segments using multiprocessing
-    with mp.Pool(mp.cpu_count()) as pool:
+    with mp.Pool(min(60, mp.cpu_count())) as pool:
         results = pool.map(find_special_numbers, segments)
 
     # Combine all results
