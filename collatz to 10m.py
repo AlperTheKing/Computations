@@ -23,6 +23,12 @@ def calculate_collatz_range(start, end):
             
     return local_number_with_max_steps, local_max_steps
 
+def split_range(start, end, num_splits):
+    step = (end - start) // num_splits
+    ranges = [(start + i * step, start + (i + 1) * step) for i in range(num_splits)]
+    ranges[-1] = (ranges[-1][0], end)  # Ensure the last range goes up to the actual end
+    return ranges
+
 def main():
     groups = [
         (1, 1000),
@@ -37,17 +43,18 @@ def main():
     num_processes = min(60, cpu_count())
     
     for start, end in groups:
-        start_time = time.time()  # Zaman ölçümünü başlat
+        start_time = time.time()
+
+        ranges = split_range(start, end, num_processes)
 
         with Pool(processes=num_processes) as pool:
-            # calculate_collatz_range fonksiyonunu her çekirdek üzerinde paralel olarak çalıştırır
-            results = pool.starmap(calculate_collatz_range, [(start, end)])
+            results = pool.starmap(calculate_collatz_range, ranges)
         
-        number_with_max_steps, max_steps = results[0]
+        number_with_max_steps, max_steps = max(results, key=lambda x: x[1])
         print(f"Range {start} to {end}:")
         print(f"  Number with max steps: {number_with_max_steps} ({max_steps} steps)")
         
-        end_time = time.time()  # Zaman ölçümünü sonlandır
+        end_time = time.time()
         elapsed_time = end_time - start_time
         print(f"Hesaplama süresi: {elapsed_time:.2f} saniye\n")
 
