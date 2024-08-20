@@ -21,8 +21,6 @@ reconstructed_signal = np.zeros_like(y, dtype=complex)
 for i in indices[:2]:  # Keep only the first two frequencies for simplicity
     reconstructed_signal += y_fft[i] * np.exp(2j * np.pi * frequencies[i] * np.arange(n))
 
-# Predict the next value by extending the reconstructed signal
-next_value = reconstructed_signal[-1].real * (y[-1] / y[-2])  # Scaling based on the last ratio
-next_value = np.real(next_value)
-
-print(f"The predicted next value in the sequence using Fourier Transform is approximately: {next_value:.0f}")
+# Predict the next value as the next point in the reconstructed signal
+next_value_no_scaling = reconstructed_signal[-1].real
+print(f"The predicted next value without scaling is approximately: {next_value_no_scaling:.0f}")
