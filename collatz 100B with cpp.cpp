@@ -1,100 +1,119 @@
 #include <iostream>
 #include <vector>
-#include <thread>
 #include <chrono>
-#include <atomic>
-#include <algorithm>
+#include <thread>
+#include <cmath>
+#include <mutex>
 
-// Collatz steps calculation
-int collatz_steps(long long n) {
-    int steps = 0;
+std::mutex mtx; // Mutex for protecting shared data
+
+// ANSI color codes
+const std::string RESET = "\033[0m";
+const std::string BOLD_RED = "\033[1;31m";
+const std::string BOLD_GREEN = "\033[1;32m";
+const std::string BOLD_YELLOW = "\033[1;33m";
+const std::string BOLD_BLUE = "\033[1;34m";
+
+// Function to calculate the number of Collatz steps for a given number
+unsigned long long collatz_steps(unsigned long long n) {
+    unsigned long long steps = 0;
     while (n != 1) {
-        if (n & 1) {  // n is odd
-            n = 3 * n + 1;
+        if (n % 2 == 0) {
+            n = n / 2;
         } else {
-            n = n >> 1;  // n / 2
+            n = 3 * n + 1;
         }
         steps++;
     }
     return steps;
 }
 
-// Split the range into subranges for each thread
-std::vector<std::pair<long long, long long>> split_range(long long start, long long end, int num_splits) {
-    long long step = (end - start) / num_splits;
-    std::vector<std::pair<long long, long long>> ranges;
-    ranges.reserve(num_splits); // Reserve memory to avoid reallocations
-    
-    for (int i = 0; i < num_splits; ++i) {
-        long long range_start = start + i * step;
-        long long range_end = (i == num_splits - 1) ? end : range_start + step;
-        ranges.emplace_back(range_start, range_end);
+// Function to find the number with maximum Collatz steps in a given range
+void find_max_collatz_steps_in_range(unsigned long long start, unsigned long long end, unsigned long long &number_with_max_steps, unsigned long long &max_steps) {
+    unsigned long long local_max_steps = 0;
+    unsigned long long local_number_with_max_steps = start;
+
+    for (unsigned long long i = start; i < end; ++i) {
+        unsigned long long steps = collatz_steps(i);
+        if (steps > local_max_steps) {
+            local_max_steps = steps;
+            local_number_with_max_steps = i;
+        }
     }
-    
-    return ranges;
+
+    // Protect shared data using mutex
+    std::lock_guard<std::mutex> guard(mtx);
+    if (local_max_steps > max_steps) {
+        max_steps = local_max_steps;
+        number_with_max_steps = local_number_with_max_steps;
+    }
+}
+
+// Wrapper function to handle threading
+void thread_task(unsigned long long start, unsigned long long end, unsigned long long &number_with_max_steps, unsigned long long &max_steps) {
+    find_max_collatz_steps_in_range(start, end, number_with_max_steps, max_steps);
 }
 
 int main() {
-    std::vector<std::pair<long long, long long>> groups = {
-        {1, 10},
-        {10, 100},
-        {100, 1000},
-        {1000, 10000},
-        {10000, 100000},
-        {100000, 1000000},
-        {1000000, 10000000},
-        {10000000, 100000000},
-        {100000000, 1000000000},
-        {1000000000, 10000000000},
-        {10000000000, 100000000000}
-    };
+    // Define the ranges, including 10^0-10^1
+    std::vector<std::pair<unsigned long long, unsigned long long>> ranges;
+    unsigned long long base = 1;  // Start from 10^0
+    for (int i = 0; i <= 10; ++i) {
+        unsigned long long start = base;
+        unsigned long long end = base * 10;
+        ranges.push_back(std::make_pair(start, end));
+        base = end;
+    }
 
-    const int num_threads = std::thread::hardware_concurrency();
+    // Loop through each range and find the number with the maximum Collatz steps
+    for (const auto &range : ranges) {
+        unsigned long long start = range.first;
+        unsigned long long end = range.second;
 
-    for (const auto& group : groups) {
+        unsigned long long number_with_max_steps = start;
+        unsigned long long max_steps = 0;
+
+        // Start timing
         auto start_time = std::chrono::high_resolution_clock::now();
-        auto ranges = split_range(group.first, group.second, num_threads);
-        
+
+        // Split the range into chunks for parallel processing
+        unsigned long long num_threads = std::thread::hardware_concurrency(); // Use the number of available cores
+        unsigned long long chunk_size = (end - start) / num_threads;
+
         std::vector<std::thread> threads;
-        threads.reserve(num_threads);
-        
-        std::vector<int> max_steps(num_threads);
-        std::vector<long long> number_with_max_steps(num_threads);
-        
-        for (int i = 0; i < num_threads; ++i) {
-            threads.emplace_back([&, i]() {
-                max_steps[i] = 0;
-                number_with_max_steps[i] = 0;
-                for (long long j = ranges[i].first; j < ranges[i].second; ++j) {
-                    int steps = collatz_steps(j);
-                    if (steps > max_steps[i]) {
-                        max_steps[i] = steps;
-                        number_with_max_steps[i] = j;
-                    }
-                }
-            });
-        }
-        
-        for (auto& thread : threads) {
-            thread.join();
+        std::vector<unsigned long long> local_max_steps(num_threads);
+        std::vector<unsigned long long> local_number_with_max_steps(num_threads);
+
+        for (unsigned long long i = 0; i < num_threads; ++i) {
+            unsigned long long chunk_start = start + i * chunk_size;
+            unsigned long long chunk_end = (i == num_threads - 1) ? end : chunk_start + chunk_size;
+
+            threads.push_back(std::thread(thread_task, chunk_start, chunk_end, std::ref(local_number_with_max_steps[i]), std::ref(local_max_steps[i])));
         }
 
-        long long max_number = 0;
-        int max_step_count = 0;
+        // Join the threads
+        for (auto &th : threads) {
+            th.join();
+        }
 
-        for (int i = 0; i < num_threads; ++i) {
-            if (max_steps[i] > max_step_count) {
-                max_step_count = max_steps[i];
-                max_number = number_with_max_steps[i];
+        // Find the overall maximum from all threads
+        for (unsigned long long i = 0; i < num_threads; ++i) {
+            if (local_max_steps[i] > max_steps) {
+                max_steps = local_max_steps[i];
+                number_with_max_steps = local_number_with_max_steps[i];
             }
         }
 
+        // End timing
         auto end_time = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double> elapsed = end_time - start_time;
+        std::chrono::duration<double> execution_time = end_time - start_time;
 
-        std::cout << "Range " << group.first << " to " << group.second << ":\n";
-        std::cout << "  Number with max steps: " << max_number << " (" << max_step_count << " steps)\n";
-        std::cout << "Computation time: " << elapsed.count() << " seconds\n\n";
+        // Display the result vertically with color
+        std::cout << BOLD_BLUE << "Range " << start << " - " << end << ":\n"
+                  << BOLD_GREEN << "Number with max steps: " << number_with_max_steps << "\n"
+                  << BOLD_YELLOW << "Steps: " << max_steps << "\n"
+                  << BOLD_RED << "Time taken: " << execution_time.count() << " seconds\n"
+                  << RESET << "-----------------------------\n";
     }
 
     return 0;
