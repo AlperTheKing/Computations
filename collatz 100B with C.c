@@ -2,6 +2,10 @@
 #include <stdlib.h>
 #include <pthread.h>
 #include <time.h>
+#include <stdint.h>
+
+#define CACHE_SIZE 1000000
+#define THREAD_COUNT 16
 
 typedef struct {
     long long start;
@@ -10,17 +14,31 @@ typedef struct {
     int max_steps;
 } RangeData;
 
-// Function to calculate the number of steps for the Collatz sequence
+int* memoization_cache;
+
+// Optimized function to calculate the number of steps for the Collatz sequence with memoization
 int collatz_steps(long long n) {
     int steps = 0;
+    long long original_n = n;
+
     while (n != 1) {
+        if (n < CACHE_SIZE && memoization_cache[n] != -1) {
+            steps += memoization_cache[n];
+            break;
+        }
+
         if (n % 2 == 0) {
-            n = n / 2;
+            n = n >> 1; // Use bitwise operation instead of division
         } else {
             n = 3 * n + 1;
         }
         steps++;
     }
+
+    if (original_n < CACHE_SIZE) {
+        memoization_cache[original_n] = steps;
+    }
+    
     return steps;
 }
 
@@ -52,6 +70,12 @@ void split_range(long long start, long long end, int num_splits, RangeData range
 }
 
 int main() {
+    // Allocate and initialize the memoization cache
+    memoization_cache = (int*)malloc(CACHE_SIZE * sizeof(int));
+    for (int i = 0; i < CACHE_SIZE; ++i) {
+        memoization_cache[i] = -1;
+    }
+
     RangeData groups[] = {
         {1, 10, 0, 0},
         {10, 100, 0, 0},
@@ -66,12 +90,8 @@ int main() {
         {10000000000, 100000000000, 0, 0}
     };
 
-    int num_threads;
-    printf("Enter the number of threads: ");
-    scanf("%d", &num_threads);
-
-    pthread_t threads[num_threads];
-    RangeData thread_data[num_threads];
+    pthread_t threads[THREAD_COUNT];
+    RangeData thread_data[THREAD_COUNT];
 
     for (int i = 0; i < sizeof(groups) / sizeof(groups[0]); ++i) {
         long long start = groups[i].start;
@@ -81,22 +101,22 @@ int main() {
         clock_t begin = clock();
 
         // Split the range into subranges for each thread
-        split_range(start, end, num_threads, thread_data);
+        split_range(start, end, THREAD_COUNT, thread_data);
 
         // Start the threads
-        for (int j = 0; j < num_threads; ++j) {
+        for (int j = 0; j < THREAD_COUNT; ++j) {
             pthread_create(&threads[j], NULL, calculate_collatz_range, &thread_data[j]);
         }
 
         // Wait for all threads to finish
-        for (int j = 0; j < num_threads; ++j) {
+        for (int j = 0; j < THREAD_COUNT; ++j) {
             pthread_join(threads[j], NULL);
         }
 
         // Collect and find the maximum result
         long long number_with_max_steps = 0;
         int max_steps = 0;
-        for (int j = 0; j < num_threads; ++j) {
+        for (int j = 0; j < THREAD_COUNT; ++j) {
             if (thread_data[j].max_steps > max_steps) {
                 max_steps = thread_data[j].max_steps;
                 number_with_max_steps = thread_data[j].number_with_max_steps;
@@ -112,6 +132,9 @@ int main() {
         printf("  Number with max steps: %lld (%d steps)\n", number_with_max_steps, max_steps);
         printf("Calculation time: %.2f seconds\n\n", elapsed_time);
     }
+
+    // Free the memoization cache
+    free(memoization_cache);
 
     return 0;
 }
