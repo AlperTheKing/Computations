@@ -88,7 +88,7 @@ int main() {
 
         std::cout << "Range " << group.first << " to " << group.second << ":\n";
         std::cout << "  Number with max steps: " << number_with_max_steps << " (" << max_steps << " steps)\n";
-        std::cout << "Hesaplama süresi: " << elapsed.count() << " saniye\n\n";
+        std::cout << "Computation time: " << elapsed.count() << " seconds\n\n";
     }
 
     return 0;
