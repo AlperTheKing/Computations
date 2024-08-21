@@ -55,10 +55,10 @@ void thread_task(unsigned long long start, unsigned long long end, unsigned long
 }
 
 int main() {
-    // Define the ranges, including 10^0-10^1
+    // Define the ranges, now including 10^11-10^12
     std::vector<std::pair<unsigned long long, unsigned long long>> ranges;
     unsigned long long base = 1;  // Start from 10^0
-    for (int i = 0; i <= 10; ++i) {
+    for (int i = 0; i <= 11; ++i) {
         unsigned long long start = base;
         unsigned long long end = base * 10;
         ranges.push_back(std::make_pair(start, end));

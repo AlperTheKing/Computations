@@ -1,140 +1,146 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
-#include <time.h>
 #include <stdint.h>
+#include <time.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <unistd.h>  // For sysconf on POSIX systems
+#endif
 
-#define CACHE_SIZE 1000000
-#define THREAD_COUNT 16
+pthread_mutex_t mtx; // Mutex for protecting shared data
 
-typedef struct {
-    long long start;
-    long long end;
-    long long number_with_max_steps;
-    int max_steps;
-} RangeData;
+// ANSI color codes
+#define RESET "\033[0m"
+#define BOLD_RED "\033[1;31m"
+#define BOLD_GREEN "\033[1;32m"
+#define BOLD_YELLOW "\033[1;33m"
+#define BOLD_BLUE "\033[1;34m"
 
-int* memoization_cache;
-
-// Optimized function to calculate the number of steps for the Collatz sequence with memoization
-int collatz_steps(long long n) {
-    int steps = 0;
-    long long original_n = n;
-
+// Function to calculate the number of Collatz steps for a given number
+uint64_t collatz_steps(uint64_t n) {
+    uint64_t steps = 0;
     while (n != 1) {
-        if (n < CACHE_SIZE && memoization_cache[n] != -1) {
-            steps += memoization_cache[n];
-            break;
-        }
-
         if (n % 2 == 0) {
-            n = n >> 1; // Use bitwise operation instead of division
+            n = n / 2;
         } else {
             n = 3 * n + 1;
         }
         steps++;
     }
-
-    if (original_n < CACHE_SIZE) {
-        memoization_cache[original_n] = steps;
-    }
-    
     return steps;
 }
 
-// Function to calculate the max steps in a given range
-void* calculate_collatz_range(void* arg) {
-    RangeData* data = (RangeData*)arg;
-    data->max_steps = 0;
-    data->number_with_max_steps = 0;
+// Struct to pass data to threads
+typedef struct {
+    uint64_t start;
+    uint64_t end;
+    uint64_t max_steps;
+    uint64_t number_with_max_steps;
+} ThreadData;
 
-    for (long long i = data->start; i < data->end; ++i) {
-        int steps = collatz_steps(i);
-        if (steps > data->max_steps) {
-            data->max_steps = steps;
-            data->number_with_max_steps = i;
+// Function to find the number with maximum Collatz steps in a given range
+void* find_max_collatz_steps_in_range(void* arg) {
+    ThreadData* data = (ThreadData*)arg;
+    uint64_t local_max_steps = 0;
+    uint64_t local_number_with_max_steps = data->start;
+
+    for (uint64_t i = data->start; i < data->end; ++i) {
+        uint64_t steps = collatz_steps(i);
+        if (steps > local_max_steps) {
+            local_max_steps = steps;
+            local_number_with_max_steps = i;
         }
     }
+
+    pthread_mutex_lock(&mtx);
+    if (local_max_steps > data->max_steps) {
+        data->max_steps = local_max_steps;
+        data->number_with_max_steps = local_number_with_max_steps;
+    }
+    pthread_mutex_unlock(&mtx);
 
     return NULL;
 }
 
-// Function to split the range into smaller subranges for threads
-void split_range(long long start, long long end, int num_splits, RangeData ranges[]) {
-    long long step = (end - start) / num_splits;
-    
-    for (int i = 0; i < num_splits; ++i) {
-        ranges[i].start = start + i * step;
-        ranges[i].end = (i == num_splits - 1) ? end : ranges[i].start + step;
-    }
+// Get the number of CPU cores
+int get_num_cores() {
+#ifdef _WIN32
+    SYSTEM_INFO sysinfo;
+    GetSystemInfo(&sysinfo);
+    return sysinfo.dwNumberOfProcessors;
+#else
+    return sysconf(_SC_NPROCESSORS_ONLN);
+#endif
 }
 
 int main() {
-    // Allocate and initialize the memoization cache
-    memoization_cache = (int*)malloc(CACHE_SIZE * sizeof(int));
-    for (int i = 0; i < CACHE_SIZE; ++i) {
-        memoization_cache[i] = -1;
+    // Define the ranges, now including 10^11-10^12
+    uint64_t ranges[12][2];
+    uint64_t base = 1;  // Start from 10^0
+    for (int i = 0; i <= 11; ++i) {
+        ranges[i][0] = base;
+        ranges[i][1] = base * 10;
+        base *= 10;
     }
 
-    RangeData groups[] = {
-        {1, 10, 0, 0},
-        {10, 100, 0, 0},
-        {100, 1000, 0, 0},
-        {1000, 10000, 0, 0},
-        {10000, 100000, 0, 0},
-        {100000, 1000000, 0, 0},
-        {1000000, 10000000, 0, 0},
-        {10000000, 100000000, 0, 0},
-        {100000000, 1000000000, 0, 0},
-        {1000000000, 10000000000, 0, 0},
-        {10000000000, 100000000000, 0, 0}
-    };
+    pthread_mutex_init(&mtx, NULL);
 
-    pthread_t threads[THREAD_COUNT];
-    RangeData thread_data[THREAD_COUNT];
+    // Loop through each range and find the number with the maximum Collatz steps
+    for (int r = 0; r < 12; ++r) {
+        uint64_t start = ranges[r][0];
+        uint64_t end = ranges[r][1];
 
-    for (int i = 0; i < sizeof(groups) / sizeof(groups[0]); ++i) {
-        long long start = groups[i].start;
-        long long end = groups[i].end;
+        uint64_t max_steps = 0;
+        uint64_t number_with_max_steps = start;
 
-        // Start timing the calculation
-        clock_t begin = clock();
+        // Start timing
+        struct timespec start_time, end_time;
+        clock_gettime(CLOCK_MONOTONIC, &start_time);
 
-        // Split the range into subranges for each thread
-        split_range(start, end, THREAD_COUNT, thread_data);
+        // Split the range into chunks for parallel processing
+        int num_threads = get_num_cores(); // Get number of available cores
+        uint64_t chunk_size = (end - start) / num_threads;
 
-        // Start the threads
-        for (int j = 0; j < THREAD_COUNT; ++j) {
-            pthread_create(&threads[j], NULL, calculate_collatz_range, &thread_data[j]);
+        pthread_t threads[num_threads];
+        ThreadData thread_data[num_threads];
+
+        for (int i = 0; i < num_threads; ++i) {
+            uint64_t chunk_start = start + i * chunk_size;
+            uint64_t chunk_end = (i == num_threads - 1) ? end : chunk_start + chunk_size;
+
+            thread_data[i].start = chunk_start;
+            thread_data[i].end = chunk_end;
+            thread_data[i].max_steps = max_steps;
+            thread_data[i].number_with_max_steps = number_with_max_steps;
+
+            pthread_create(&threads[i], NULL, find_max_collatz_steps_in_range, &thread_data[i]);
         }
 
-        // Wait for all threads to finish
-        for (int j = 0; j < THREAD_COUNT; ++j) {
-            pthread_join(threads[j], NULL);
-        }
-
-        // Collect and find the maximum result
-        long long number_with_max_steps = 0;
-        int max_steps = 0;
-        for (int j = 0; j < THREAD_COUNT; ++j) {
-            if (thread_data[j].max_steps > max_steps) {
-                max_steps = thread_data[j].max_steps;
-                number_with_max_steps = thread_data[j].number_with_max_steps;
+        // Join the threads
+        for (int i = 0; i < num_threads; ++i) {
+            pthread_join(threads[i], NULL);
+            if (thread_data[i].max_steps > max_steps) {
+                max_steps = thread_data[i].max_steps;
+                number_with_max_steps = thread_data[i].number_with_max_steps;
             }
         }
 
-        // End timing the calculation
-        clock_t end_time = clock();
-        double elapsed_time = (double)(end_time - begin) / CLOCKS_PER_SEC;
+        // End timing
+        clock_gettime(CLOCK_MONOTONIC, &end_time);
+        double execution_time = (end_time.tv_sec - start_time.tv_sec) +
+                                (end_time.tv_nsec - start_time.tv_nsec) / 1e9;
 
-        // Print the results
-        printf("Range %lld to %lld:\n", start, end);
-        printf("  Number with max steps: %lld (%d steps)\n", number_with_max_steps, max_steps);
-        printf("Calculation time: %.2f seconds\n\n", elapsed_time);
+        // Display the result vertically with color
+        printf(BOLD_BLUE "Range %lu - %lu:\n" RESET, start, end);
+        printf(BOLD_GREEN "Number with max steps: %lu\n" RESET, number_with_max_steps);
+        printf(BOLD_YELLOW "Steps: %lu\n" RESET, max_steps);
+        printf(BOLD_RED "Time taken: %.6f seconds\n" RESET, execution_time);
+        printf("-----------------------------\n");
     }
 
-    // Free the memoization cache
-    free(memoization_cache);
+    pthread_mutex_destroy(&mtx);
 
     return 0;
 }
