@@ -1,43 +1,48 @@
 #include <iostream>
-#include <cmath>
 #include <vector>
-#include <tuple>
-#include <algorithm>
+#include <cmath>
 #include <omp.h>
 
-int main() {
-    int total_count = 0;
-    std::vector<std::tuple<int, int, int>> all_triplets;
-    double tolerance = 1e-9;
+// Function to check the triplet condition
+bool check_triplet(unsigned long long a, unsigned long long b, unsigned long long c) {
+    unsigned long long term = (8 * std::pow(a, 3)) + (15 * std::pow(a, a)) + (6 * a) - (27 * std::pow(b, 2) * c);
+    return (term == 1);
+}
 
-    // Parallel processing with OpenMP
-    #pragma omp parallel for reduction(+:total_count)
-    for (int a = 0; a < 1000; ++a) {
-        std::vector<std::tuple<int, int, int>> local_triplets;
-        for (int b = 0; b < 1000; ++b) {
-            for (int c = 0; c < 1000; ++c) {
-                double term1 = std::cbrt(a + b * std::sqrt(c));
-                double term2 = std::cbrt(a - b * std::sqrt(c));
-
-                if (std::abs((term1 + term2) - 1) < tolerance) {
-                    local_triplets.push_back(std::make_tuple(a, b, c));
-                    total_count++;
-                }
+// Function to process a range of values for a
+std::vector<std::tuple<unsigned long long, unsigned long long, unsigned long long>> process_range(unsigned long long a, unsigned long long r) {
+    std::vector<std::tuple<unsigned long long, unsigned long long, unsigned long long>> results;
+    for (unsigned long long b = 0; b < r; ++b) {
+        for (unsigned long long c = 0; c < r; ++c) {
+            if (check_triplet(a, b, c)) {
+                results.emplace_back(a, b, c);
             }
         }
+    }
+    return results;
+}
 
+int main() {
+    const unsigned long long r = 1000;
+    std::vector<std::tuple<unsigned long long, unsigned long long, unsigned long long>> found_triplets;
+
+    // Parallelized loop using OpenMP
+    #pragma omp parallel for schedule(dynamic)
+    for (unsigned long long a = 0; a < r; ++a) {
+        std::vector<std::tuple<unsigned long long, unsigned long long, unsigned long long>> local_results = process_range(a, r);
         #pragma omp critical
         {
-            all_triplets.insert(all_triplets.end(), local_triplets.begin(), local_triplets.end());
+            found_triplets.insert(found_triplets.end(), local_results.begin(), local_results.end());
         }
     }
 
-    // Print the triplets
-    for (const auto& triplet : all_triplets) {
-        std::cout << "Triplet: (" << std::get<0>(triplet) << ", " << std::get<1>(triplet) << ", " << std::get<2>(triplet) << ")\n";
-    }
+    // Output the total number of found triplets
+    std::cout << found_triplets.size() << " triplet(s) found" << std::endl;
 
-    std::cout << total_count << " triplet found" << std::endl;
+    // Print all found triplets
+    for (const auto& triplet : found_triplets) {
+        std::cout << std::get<0>(triplet) << ", " << std::get<1>(triplet) << ", " << std::get<2>(triplet) << std::endl;
+    }
 
     return 0;
 }

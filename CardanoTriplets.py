@@ -1,57 +1,39 @@
-#include <iostream>
-#include <cmath>
-#include <vector>
-#include <algorithm>
-#include <omp.h>
-#include <chrono>
+import multiprocessing
 
-struct Triplet {
-    int a, b, c;
-};
+# Function to check the triplet condition
+def check_triplet(a, b, c):
+    term = (8 * (a ** 3)) + (15 * (a ** a)) + (6 * a) - (27 * (b ** 2) * c)
+    if term == 1:
+        return (a, b, c)
+    return None
 
-int main() {
-    int count = 0;
-    std::vector<Triplet> triplets;
+# Function to process a range of values for a
+def process_range(a, r):
+    results = []
+    for b in range(r):
+        for c in range(r):
+            result = check_triplet(a, b, c)
+            if result:
+                results.append(result)
+    return results
 
-    // Zaman ölçümünü başlat
-    auto start = std::chrono::high_resolution_clock::now();
+if __name__ == '__main__':
+    r = 1000
+    count = 0
+    found_triplets = []
 
-    // OpenMP parallelization
-    #pragma omp parallel for collapse(3) reduction(+:count)
-    for (int a = 0; a <= 110000000; ++a) {
-        for (int b = 0; b <= 110000000; ++b) {
-            for (int c = 0; c <= 110000000; ++c) {
-                if (8*a*a*a + 15*a*a + 6*a - 27*b*b*c == 1) {
-                    double expr1 = std::cbrt(a + b * std::sqrt(c));
-                    double expr2 = std::cbrt(a - b * std::sqrt(c));
-                    if (expr1 + expr2 == 1) {
-                        #pragma omp critical
-                        {
-                            triplets.push_back({a, b, c});
-                        }
-                        count++;
-                    }
-                }
-            }
-        }
-    }
+    # Define the pool of workers (using all available CPUs)
+    with multiprocessing.Pool() as pool:
+        # Map the function `process_range` over the range of a values
+        results = pool.starmap(process_range, [(a, r) for a in range(r)])
+    
+    # Flatten the list of results and count the triplets
+    for sublist in results:
+        found_triplets.extend(sublist)
+        count += len(sublist)
+    
+    # Print all found triplets
+    for triplet in found_triplets:
+        print(triplet)
 
-    // Tripletleri 'a' değerine göre sırala
-    std::sort(triplets.begin(), triplets.end(), [](const Triplet& t1, const Triplet& t2) {
-        return t1.a < t2.a;
-    });
-
-    // Zaman ölçümünü bitir
-    auto end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> elapsed = end - start;
-
-    // Sıralanmış tripletleri yazdır
-    for (const auto& triplet : triplets) {
-        std::cout << triplet.a << " " << triplet.b << " " << triplet.c << std::endl;
-    }
-
-    std::cout << count << " triplet(s) found" << std::endl;
-    std::cout << "Elapsed time: " << elapsed.count() << " seconds" << std::endl;
-
-    return 0;
-}
+    print(f"{count} triplet(s) found")
