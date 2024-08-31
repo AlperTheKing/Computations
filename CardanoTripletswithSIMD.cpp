@@ -3,38 +3,23 @@
 #include <tuple>
 #include <omp.h>
 #include <chrono>
-#include <arm_neon.h>  // For NEON intrinsics
+#include <algorithm>
 
-// Function to check the triplet condition using SIMD for b and c values
+// Function to check the triplet condition using scalar operations
 std::vector<std::tuple<unsigned long long, unsigned long long, unsigned long long>> process_range(unsigned long long a, unsigned long long r) {
     std::vector<std::tuple<unsigned long long, unsigned long long, unsigned long long>> results;
-    
-    uint64x2_t a_vec = vdupq_n_u64(a);
-    uint64x2_t a2_vec = vmulq_u64(a_vec, a_vec);
-    uint64x2_t a3_vec = vmulq_u64(a2_vec, a_vec);
-    
-    uint64x2_t term1 = vmulq_n_u64(a3_vec, 8);
-    uint64x2_t term2 = vmulq_n_u64(a2_vec, 15);
-    uint64x2_t term3 = vmulq_n_u64(a_vec, 6);
+
+    // Precompute parts of the term for efficiency
+    unsigned long long a3 = 8 * a * a * a;
+    unsigned long long a2 = 15 * a * a;
+    unsigned long long a1 = 6 * a;
 
     for (unsigned long long b = 0; b < r; ++b) {
-        uint64x2_t b_vec = vdupq_n_u64(b);
-        uint64x2_t b2_vec = vmulq_u64(b_vec, b_vec);
-        
-        for (unsigned long long c = 0; c < r; c += 2) { // Process 2 c values in parallel
-            uint64x2_t c_vec = {c, c+1};
-            uint64x2_t bc_vec = vmulq_u64(b2_vec, c_vec);
-            
-            // Calculate the final term
-            uint64x2_t term = vaddq_u64(vaddq_u64(term1, term2), term3);
-            term = vsubq_u64(term, vmulq_n_u64(bc_vec, 27));
-
-            // Check if the condition is met for either of the SIMD lanes
-            if (vgetq_lane_u64(term, 0) == 1) {
+        unsigned long long b2 = b * b;
+        for (unsigned long long c = 0; c < r; ++c) {
+            unsigned long long term = a3 + a2 + a1 - 27 * b2 * c;
+            if (term == 1) {
                 results.emplace_back(a, b, c);
-            }
-            if (vgetq_lane_u64(term, 1) == 1) {
-                results.emplace_back(a, b, c + 1);
             }
         }
     }
@@ -42,7 +27,7 @@ std::vector<std::tuple<unsigned long long, unsigned long long, unsigned long lon
 }
 
 int main() {
-    const unsigned long long r = 1000000; // Example range, adjust as needed
+    const unsigned long long r = 10000; // Example range, adjust as needed
     std::vector<std::tuple<unsigned long long, unsigned long long, unsigned long long>> found_triplets;
 
     // Start timing
@@ -63,6 +48,9 @@ int main() {
         #pragma omp critical
         found_triplets.insert(found_triplets.end(), local_results.begin(), local_results.end());
     }
+
+    // Sort triplets by the first element (a) in ascending order
+    std::sort(found_triplets.begin(), found_triplets.end());
 
     // Stop timing
     auto end = std::chrono::high_resolution_clock::now();
