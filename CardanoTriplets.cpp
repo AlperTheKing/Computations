@@ -1,60 +1,42 @@
 #include <iostream>
-#include <vector>
 #include <cmath>
-#include <tuple>
 #include <omp.h>
 #include <chrono>
 
-// Function to check the triplet condition
-bool check_triplet(unsigned long long a, unsigned long long b, unsigned long long c) {
-    unsigned long long term = (8 * std::pow(a, 3)) + (15 * std::pow(a, 2)) + (6 * a) - (27 * std::pow(b, 2) * c);
-    return (term == 1);
-}
+int main() {
+    long long max_sum = 1000000; // Initial maximum value for a + b + c
+    long long max_k = max_sum / 6.5; // Maximum value of k based on the max_sum
 
-// Function to process a range of values for a
-std::vector<std::tuple<unsigned long long, unsigned long long, unsigned long long>> process_range(unsigned long long a, unsigned long long r) {
-    std::vector<std::tuple<unsigned long long, unsigned long long, unsigned long long>> results;
-    for (unsigned long long b = 0; b < r; ++b) {
-        for (unsigned long long c = 0; c < r; ++c) {
-            if (check_triplet(a, b, c)) {
-                results.emplace_back(a, b, c);
+    long long total_triplets = 0;
+
+    auto start = std::chrono::high_resolution_clock::now();
+
+    #pragma omp parallel for schedule(dynamic)
+    for (long long k = 0; k <= max_k; ++k) {
+        long long a = 2 + 3 * k;
+        long long k1 = k + 1;
+        long long term = k1 * k1 * (8 * k + 5);
+
+        for (long long b = 1; b * b <= term; ++b) {
+            if (term % (b * b) == 0) {
+                long long c = term / (b * b);
+                long long abc_sum = a + b + c;
+
+                // Ensure a, b, c are positive integers and their sum is within the limit
+                if (a > 0 && b > 0 && c > 0 && abc_sum <= max_sum) {
+                    #pragma omp atomic
+                    total_triplets++;
+                }
             }
         }
     }
-    return results;
-}
 
-int main() {
-    const unsigned long long r = 1000000; // You can increase this to 110 million, but it will take significant time
-    std::vector<std::tuple<unsigned long long, unsigned long long, unsigned long long>> found_triplets;
-
-    // Zaman ölçümünü başlat
-    auto start = std::chrono::high_resolution_clock::now();
-
-    // Parallelized loop using OpenMP
-    #pragma omp parallel for schedule(dynamic)
-    for (unsigned long long a = 0; a < r; ++a) {
-        std::vector<std::tuple<unsigned long long, unsigned long long, unsigned long long>> local_results = process_range(a, r);
-        #pragma omp critical
-        {
-            found_triplets.insert(found_triplets.end(), local_results.begin(), local_results.end());
-        }
-    }
-
-    // Zaman ölçümünü bitir
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> elapsed = end - start;
 
-    // Bulunan tripletleri ekrana yazdır
-    for (const auto& triplet : found_triplets) {
-        std::cout << std::get<0>(triplet) << ", " << std::get<1>(triplet) << ", " << std::get<2>(triplet) << std::endl;
-    }
-
-    // Triplet sayısını yazdır
-    std::cout << found_triplets.size() << " triplet(s) found" << std::endl;
-
-    // Toplam geçen süreyi en sona yazdır
-    std::cout << "Elapsed time: " << elapsed.count() << " seconds" << std::endl;
+    // Output the total number of triplets and the elapsed time
+    std::cout << "Total triplets found: " << total_triplets << "\n";
+    std::cout << "Elapsed time: " << elapsed.count() << " seconds\n";
 
     return 0;
 }
