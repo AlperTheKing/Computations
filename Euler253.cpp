@@ -6,10 +6,11 @@
 #include <omp.h>
 #include <chrono>
 #include <iomanip>
+#include <thread> // For std::this_thread::get_id
 
 int main() {
     const int num_pieces = 40; // Number of pieces
-    const long long num_simulations = 10000000000LL; // Number of simulations
+    const long long num_simulations = 100000000000LL; // Number of simulations
 
     long long total_max_segments = 0;
 
@@ -17,9 +18,13 @@ int main() {
 
     #pragma omp parallel
     {
-        // Use 64-bit Mersenne Twister with a unique seed per thread
+        // Combine thread ID and random_device for seeding
         std::random_device rd;
-        std::mt19937_64 rng(rd() ^ (std::mt19937_64::result_type)omp_get_thread_num());
+        unsigned long long seed = rd() ^ 
+                                  (std::hash<std::thread::id>()(std::this_thread::get_id()) + 
+                                  std::chrono::system_clock::now().time_since_epoch().count());
+
+        std::mt19937_64 rng(seed);
         std::uniform_int_distribution<int> dist(1, num_pieces);
 
         long long local_total = 0;
