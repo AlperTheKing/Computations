@@ -1,15 +1,15 @@
 #include <iostream>
 #include <vector>
 #include <algorithm>
-#include <random>  // For random number generation
-#include <numeric> // For std::iota
+#include <random>
+#include <numeric>
 #include <omp.h>
 #include <chrono>
-#include <iomanip> // For setting precision
+#include <iomanip>
 
 int main() {
-    const int num_pieces = 40; // Changed to 10 pieces
-    const int num_simulations = 1000000000; // Number of simulations for averaging
+    const int num_pieces = 40; // Number of pieces
+    const long long num_simulations = 10000000000LL; // Number of simulations
 
     long long total_max_segments = 0;
 
@@ -17,16 +17,16 @@ int main() {
 
     #pragma omp parallel
     {
-        std::mt19937 rng(std::random_device{}()); // Thread-local random number generator
+        std::mt19937 rng(std::random_device{}() + omp_get_thread_num()); // Unique seed per thread
         long long local_total = 0;
 
         #pragma omp for
-        for (int i = 0; i < num_simulations; ++i) {
+        for (long long i = 0; i < num_simulations; ++i) {
             std::vector<int> pieces(num_pieces);
-            std::iota(pieces.begin(), pieces.end(), 1); // Fill with 1 to num_pieces
-            std::shuffle(pieces.begin(), pieces.end(), rng); // Randomly shuffle pieces
+            std::iota(pieces.begin(), pieces.end(), 1);
+            std::shuffle(pieces.begin(), pieces.end(), rng);
 
-            std::vector<bool> placed(num_pieces + 1, false); // Track placed pieces
+            std::vector<bool> placed(num_pieces + 1, false);
             int segments = 0;
             int max_segments = 0;
 
@@ -34,14 +34,13 @@ int main() {
                 int piece = pieces[j];
                 placed[piece] = true;
 
-                // Check if piece creates or merges segments
                 if (placed[piece - 1] && placed[piece + 1]) {
-                    segments--; // Merges two segments
+                    segments--;
                 } else if (!placed[piece - 1] && !placed[piece + 1]) {
-                    segments++; // Creates a new segment
+                    segments++;
                 }
-                
-                max_segments = std::max(max_segments, segments); // Update max segments
+
+                max_segments = std::max(max_segments, segments);
             }
 
             local_total += max_segments;
@@ -56,7 +55,6 @@ int main() {
 
     double average_max_segments = static_cast<double>(total_max_segments) / num_simulations;
 
-    // Set precision to 6 decimal places
     std::cout << std::fixed << std::setprecision(6);
     std::cout << "Average maximum number of segments: " << average_max_segments << std::endl;
     std::cout << "Elapsed time: " << elapsed.count() << " seconds" << std::endl;
