@@ -17,7 +17,11 @@ int main() {
 
     #pragma omp parallel
     {
-        std::mt19937 rng(std::random_device{}() + omp_get_thread_num()); // Unique seed per thread
+        // Use 64-bit Mersenne Twister with a unique seed per thread
+        std::random_device rd;
+        std::mt19937_64 rng(rd() ^ (std::mt19937_64::result_type)omp_get_thread_num());
+        std::uniform_int_distribution<int> dist(1, num_pieces);
+
         long long local_total = 0;
 
         #pragma omp for
