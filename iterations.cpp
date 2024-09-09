@@ -58,7 +58,7 @@ int main() {
     // Create threads for parallel execution
     vector<thread> threads;
     int num_threads = 20;
-    unsigned long long kmax = 1000000;
+    unsigned long long kmax = 100000;
     unsigned long long range_per_thread = kmax / num_threads;
 
     // Launch 20 threads
