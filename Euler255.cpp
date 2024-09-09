@@ -2,12 +2,11 @@
 #include <omp.h>
 #include <chrono>
 #include <iomanip>
-#include "Random123/philox.h"
 #include <cmath>
 
 // Function to calculate the number of digits in an unsigned long long number
 int numberOfDigits(unsigned long long n) {
-    return std::to_string(n).length();  // Get the length of the number as a string
+    return std::to_string(n).length();
 }
 
 // Function to compute the rounded square root using Heron's method (adapted for integers)
@@ -36,22 +35,11 @@ int roundedSquareRoot(unsigned long long n) {
     return iterations;
 }
 
-// Function to generate a random 14-digit number using Random123
-unsigned long long generateRandomNumber(r123::Philox4x32::ctr_type& ctr, r123::Philox4x32::key_type& key) {
-    r123::Philox4x32 rng;
-    ctr = rng(ctr, key);
-    
-    // Generate two parts to create a 14-digit random number
-    unsigned long long part1 = ctr[0] % 100000000ULL;  // First 8 digits
-    unsigned long long part2 = ctr[1] % 10000000ULL;   // Next 7 digits
-
-    // Combine the two parts to create a 14-digit number
-    return part1 * 10000000ULL + part2;
-}
-
 int main() {
-    const unsigned long long numberOfTests = 10000000000;  // 10 billion tests
-    long long sumIterations = 0;
+    const unsigned long long startRange = 10000000000000ULL;  // Start of the range 10^13
+    const unsigned long long endRange = 100000000000000ULL;   // End of the range 10^14 (exclusive)
+    unsigned long long totalIterations = 0;                   // To accumulate total iterations
+    unsigned long long numberOfNumbers = endRange - startRange;  // Total numbers in the range
 
     omp_set_num_threads(64);  // Use all cores on AMD Threadripper 7980X
 
@@ -59,19 +47,10 @@ int main() {
     auto start = std::chrono::high_resolution_clock::now();
 
     // Parallelized loop with OpenMP
-    #pragma omp parallel reduction(+:sumIterations)
-    {
-        r123::Philox4x32::ctr_type ctr = {0, 0, 0, 0};
-        r123::Philox4x32::key_type key = {52769};  // You can seed this key differently
-        ctr[0] = omp_get_thread_num();  // Ensure each thread has a different starting counter
-
-        #pragma omp for schedule(dynamic, 10000)
-        for (unsigned long long i = 0; i < numberOfTests; ++i) {
-            ctr[1] = i;  // Change the counter for each iteration
-            unsigned long long randomNumber = generateRandomNumber(ctr, key);  // Generate random 14-digit number
-            int iterations = roundedSquareRoot(randomNumber);  // Find the rounded square root
-            sumIterations += iterations;
-        }
+    #pragma omp parallel for reduction(+:totalIterations)
+    for (unsigned long long n = startRange; n < endRange; ++n) {
+        int iterations = roundedSquareRoot(n);  // Calculate iterations for number n
+        totalIterations += iterations;          // Accumulate total iterations
     }
 
     // Stop measuring time
@@ -79,10 +58,11 @@ int main() {
     std::chrono::duration<double> elapsed = end - start;
 
     // Calculate the average number of iterations
-    double averageIterations = static_cast<double>(sumIterations) / numberOfTests;
+    double averageIterations = static_cast<double>(totalIterations) / numberOfNumbers;
 
     // Output the results
-    std::cout << "Average number of iterations: " << std::fixed << std::setprecision(10) << averageIterations << std::endl;
+    std::cout << "Average number of iterations for the range [10^13, 10^14): " 
+              << std::fixed << std::setprecision(10) << averageIterations << std::endl;
     std::cout << "Elapsed time: " << elapsed.count() << " seconds" << std::endl;
 
     return 0;
