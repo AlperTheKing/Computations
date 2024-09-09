@@ -17,7 +17,7 @@ unsigned long long sum_of_squares(int a, int b) {
 }
 
 int main() {
-    const unsigned long long LIMIT = 10000000000ULL;  // 10^10
+    const unsigned long long LIMIT = 1000;  // Reduced limit to 1000
     set<unsigned long long> square_pivots;
     
     // Start time measurement
@@ -25,7 +25,7 @@ int main() {
 
     // Parallelized outer loop over k
     #pragma omp parallel for schedule(dynamic)
-    for (unsigned long long k = 1; k <= sqrt(LIMIT); ++k) {
+    for (unsigned long long k = 1; k <= static_cast<unsigned long long>(sqrt(LIMIT)); ++k) {
         for (int m = 1; m < k; ++m) {
             unsigned long long left_sum = sum_of_squares(k - m, k);  // Sum of m+1 consecutive squares ending at k
             
@@ -38,7 +38,10 @@ int main() {
             
             if (left_sum == right_sum) {
                 #pragma omp critical
-                square_pivots.insert(k);  // Insert valid k into the set to ensure uniqueness
+                {
+                    square_pivots.insert(k);  // Insert valid k into the set to ensure uniqueness
+                    cout << "Found square pivot: k = " << k << endl;  // Print the found value of k
+                }
             }
         }
     }
