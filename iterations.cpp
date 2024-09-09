@@ -32,7 +32,7 @@ void find_solutions(int k_start, int k_end, vector<Solution>& solutions, unsigne
 
             // Conditional logic for determining max_m based on the value of a
             if (a == 0) {
-                max_m = sqrt(kmax / 2);  // Use sqrt(k / 2) for each k
+                max_m = sqrt(kmax / 2);  // Use kmax when calculating m for a = 0
             } else {
                 max_m = kmax / 1000;     // When a != 0, m goes up to k/1000
             }
@@ -55,13 +55,15 @@ int main() {
 
     vector<Solution> solutions;  // To store all the solutions
 
-    // Create threads for parallel execution
-    vector<thread> threads;
-    int num_threads = 20;
+    // Automatically determine the number of cores from the system
+    int num_threads = thread::hardware_concurrency();
+    if (num_threads == 0) num_threads = 1;  // Fallback in case the function returns 0
+
     unsigned long long kmax = 100000;
     unsigned long long range_per_thread = kmax / num_threads;
 
-    // Launch 20 threads
+    // Create threads for parallel execution
+    vector<thread> threads;
     for (int i = 0; i < num_threads; ++i) {
         unsigned long long k_start = i * range_per_thread + 1;
         unsigned long long k_end = (i + 1) * range_per_thread;
