@@ -5,6 +5,7 @@
 #include <random123/threefry.h>
 #include <random123/philox.h>
 #include <thread>  // For hardware concurrency
+#include <cstdint> // For std::intptr_t
 
 #define NUM_SPINS 1000000000  // 1 billion simulations
 #define TOTAL_NUMBERS 37      // European Roulette: 0 to 36
@@ -37,7 +38,7 @@ struct ThreadResult {
 
 // Function to simulate roulette bets for each thread
 void* simulate_roulette(void* arg) {
-    long thread_id = (long) arg;
+    std::intptr_t thread_id = reinterpret_cast<std::intptr_t>(arg);
     ThreadResult* result = new ThreadResult{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 
     using rng_t = r123::Philox4x32;  // Use random123 Philox generator
@@ -109,6 +110,7 @@ void* simulate_roulette(void* arg) {
     }
 
     pthread_exit(result);
+    return nullptr;  // Return statement to satisfy the function return type
 }
 
 int main() {
@@ -128,7 +130,7 @@ int main() {
 
     // Create and run threads
     for (long t = 0; t < num_threads; ++t) {
-        pthread_create(&threads[t], nullptr, simulate_roulette, (void*) t);
+        pthread_create(&threads[t], nullptr, simulate_roulette, reinterpret_cast<void*>(static_cast<std::intptr_t>(t)));
     }
 
     // Collect results from each thread
