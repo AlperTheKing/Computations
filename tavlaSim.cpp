@@ -5,6 +5,7 @@
 #include <random123/philox.h>
 #include <thread>  // For hardware concurrency
 #include <cstdlib> // For abs()
+#include <cstdint> // For std::intptr_t
 
 #define NUM_SIMULATIONS 1000000  // 1 million simulations
 #define POINTS_ON_BOARD 24       // Total number of points on the backgammon board
@@ -93,7 +94,7 @@ bool all_pieces_borne_off(const Player &player) {
 }
 
 // Simulate one full game
-int simulate_game(long thread_id) {
+int simulate_game(std::intptr_t thread_id) {
     Player player1, player2;
 
     // Set up initial board configuration (example setup)
@@ -138,9 +139,10 @@ int simulate_game(long thread_id) {
 }
 
 void *run_simulations(void *threadid) {
-    long tid = (long) threadid;
+    std::intptr_t tid = reinterpret_cast<std::intptr_t>(threadid);  // Use std::intptr_t for casting
     int *result = new int(simulate_game(tid));
-    pthread_exit((void *) result);
+    pthread_exit(static_cast<void *>(result));  // Return the result correctly
+    return nullptr;  // Explicitly return nullptr to satisfy the return type
 }
 
 int main() {
@@ -157,7 +159,7 @@ int main() {
     auto start_time = std::chrono::high_resolution_clock::now();
 
     for (long t = 0; t < num_threads; ++t) {
-        pthread_create(&threads[t], nullptr, run_simulations, (void *) t);
+        pthread_create(&threads[t], nullptr, run_simulations, reinterpret_cast<void*>(static_cast<std::intptr_t>(t)));
     }
 
     long long total_player1_wins = 0;
