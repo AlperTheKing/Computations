@@ -17,7 +17,7 @@ unsigned long long sum_of_squares(int a, int b) {
 }
 
 int main() {
-    const unsigned long long LIMIT = 1000;  // Reduced limit to 1000
+    const unsigned long long LIMIT = 100000;  // Reduced limit to 1000
     set<unsigned long long> square_pivots;
     
     // Start time measurement

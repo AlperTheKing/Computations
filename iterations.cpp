@@ -59,7 +59,7 @@ int main() {
     int num_threads = thread::hardware_concurrency();
     if (num_threads == 0) num_threads = 1;  // Fallback in case the function returns 0
 
-    unsigned long long kmax = 100000;
+    unsigned long long kmax = 1000000;
     unsigned long long range_per_thread = kmax / num_threads;
 
     // Create threads for parallel execution
