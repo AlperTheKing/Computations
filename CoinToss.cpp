@@ -1,122 +1,113 @@
 #include <iostream>
 #include <pthread.h>
+#include <vector>
 #include <chrono>
-#include <random123/philox.h>  // Include Random123 library for philox
-#include <thread>  // For std::thread::hardware_concurrency()
-#include <cstdint>  // For uint32_t
+#include <thread>  // For hardware_concurrency()
+
+#include "random123/xoshiro256plusplus.h"  // Include the xoshiro256plusplus.h
+
+#define NUM_SIMULATIONS 1000000000  // Define total number of simulations
 
 using namespace std;
-using namespace chrono;
-using r123::Philox4x32;  // Using Philox RNG from Random123
+using namespace std::chrono;
 
-// Constants
-const unsigned long long SIMULATIONS = 100000000000ULL;  // 100 billion simulations
-unsigned int numThreads = 8;  // Number of threads
+// Coin flipping results
+const string pattern1 = "HTTTH";
+const string pattern2 = "HTTHH";
 
-// Thread-safe counters
-unsigned long long HTTTH_count = 0;
-unsigned long long HTHTH_count = 0;
-pthread_mutex_t pthread_mutex = PTHREAD_MUTEX_INITIALIZER;
+// Thread data structure
+struct ThreadData {
+    int id;
+    int count1;
+    int count2;
+    int num_simulations;
+};
 
-// Random123 typedefs
-typedef Philox4x32 RNG;
-RNG rng;
+// Function to simulate coin flips and look for patterns
+void* simulate_flips(void* threadarg) {
+    ThreadData* data = (ThreadData*)threadarg;
 
-// Function to check for patterns (stopping condition)
-bool checkPattern(uint32_t sequence, uint32_t pattern) {
-    return (sequence & 0x1F) == pattern;  // Mask the last 5 bits and check for a match
-}
+    string flips;
+    int count1 = 0, count2 = 0;
 
-// Function to simulate coin flips until one of the patterns appears
-void* simulateFlips(void* arg) {
-    unsigned long long localHTTTH_count = 0;
-    unsigned long long localHTHTH_count = 0;
+    for (int i = 0; i < data->num_simulations; i++) {
+        flips.clear();
 
-    // Set up Random123 generator
-    uint32_t tid = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(arg));
-    RNG::ctr_type counter = {{0, tid, 0, 0}};  // Each thread uses a different counter
-    RNG::ukey_type key = {{0xdeadbeef}};  // Arbitrary key
-
-    unsigned long long flipsPerThread = SIMULATIONS / numThreads;
-
-    // Define patterns
-    const uint32_t HTTTH_pattern = 0b01110;  // HTTTH in binary (H=0, T=1)
-    const uint32_t HTHTH_pattern = 0b01010;  // HTHTH in binary (H=0, T=1)
-
-    for (unsigned long long i = 0; i < flipsPerThread; ++i) {
-        uint32_t sequence = 0;  // Store the last 5 flips
-
-        // Keep flipping until one of the patterns appears
         while (true) {
-            counter[0] = i;  // Increment the counter for each flip
-            RNG::ctr_type result = rng(counter, key);
+            // Generate random bit (0 for T, 1 for H)
+            uint64_t rand_value = next();  // Use the next() function from xoshiro256plusplus.h
+            int coin_flip = rand_value % 2;  // either 0 (Tails) or 1 (Heads)
 
-            // Simulate flipping and shifting the sequence (last 5 flips)
-            sequence = ((sequence << 1) | (result[0] & 1)) & 0x1F;  // Shift left and add new flip
-
-            // Check if the pattern "HTTTH" appears
-            if (checkPattern(sequence, HTTTH_pattern)) {
-                localHTTTH_count++;
-                break;
+            flips += (coin_flip == 0) ? 'T' : 'H';
+            if (flips.size() > 5) {
+                flips.erase(0, 1);  // Keep only the last 5 flips
             }
-            // Check if the pattern "HTHTH" appears
-            else if (checkPattern(sequence, HTHTH_pattern)) {
-                localHTHTH_count++;
+
+            // Check for pattern
+            if (flips == pattern1) {
+                count1++;
+                break;
+            } else if (flips == pattern2) {
+                count2++;
                 break;
             }
         }
     }
 
-    // Lock the mutex before updating the global count
-    pthread_mutex_lock(&pthread_mutex);
-    HTTTH_count += localHTTTH_count;
-    HTHTH_count += localHTHTH_count;
-    pthread_mutex_unlock(&pthread_mutex);
+    data->count1 = count1;
+    data->count2 = count2;
 
-    return nullptr;
+    pthread_exit(NULL);
 }
 
 int main() {
-    // Get the number of available threads
-    numThreads = std::thread::hardware_concurrency();
-    if (numThreads == 0) {
-        numThreads = 2;  // Fallback to 2 threads if hardware_concurrency() cannot determine
+    // Initialize the state (s) for xoshiro256++
+    s[0] = 123456789;
+    s[1] = 987654321;
+    s[2] = 111111111;
+    s[3] = 222222222;
+
+    // Get the number of hardware threads available on the system
+    int num_threads = std::thread::hardware_concurrency();
+    if (num_threads == 0) {
+        num_threads = 4;  // Default to 4 threads if hardware_concurrency() fails
     }
 
-    cout << "Using " << numThreads << " threads." << endl;
+    pthread_t threads[num_threads];
+    ThreadData thread_data[num_threads];
+    int total_count1 = 0, total_count2 = 0;
 
-    // Time measurement start
     auto start = high_resolution_clock::now();
 
     // Create threads
-    pthread_t threads[numThreads];
-    for (unsigned int i = 0; i < numThreads; ++i) {
-        pthread_create(&threads[i], nullptr, simulateFlips, (void*)(uintptr_t)i);
+    for (int i = 0; i < num_threads; i++) {
+        thread_data[i].id = i;
+        thread_data[i].count1 = 0;
+        thread_data[i].count2 = 0;
+        thread_data[i].num_simulations = NUM_SIMULATIONS / num_threads;
+        int rc = pthread_create(&threads[i], NULL, simulate_flips, (void*)&thread_data[i]);
+        if (rc) {
+            cout << "Error: Unable to create thread," << rc << endl;
+            exit(-1);
+        }
     }
 
-    // Join threads
-    for (unsigned int i = 0; i < numThreads; ++i) {
-        pthread_join(threads[i], nullptr);
+    // Join threads and collect results
+    for (int i = 0; i < num_threads; i++) {
+        pthread_join(threads[i], NULL);
+        total_count1 += thread_data[i].count1;
+        total_count2 += thread_data[i].count2;
     }
 
-    // Time measurement end
-    auto end = high_resolution_clock::now();
-    duration<double> elapsed = end - start;
+    auto stop = high_resolution_clock::now();
+    auto duration = duration_cast<milliseconds>(stop - start);
 
-    // Calculate results
-    cout << "HTTTH count: " << HTTTH_count << endl;
-    cout << "HTHTH count: " << HTHTH_count << endl;
-    cout << "Total simulations: " << SIMULATIONS << endl;
-    cout << "Time elapsed: " << elapsed.count() << " seconds." << endl;
+    // Output results
+    cout << "Pattern " << pattern1 << " appeared: " << total_count1 << " times\n";
+    cout << "Pattern " << pattern2 << " appeared: " << total_count2 << " times\n";
+    cout << "Total simulations: " << NUM_SIMULATIONS << "\n";
+    cout << "Time taken: " << duration.count() << " milliseconds\n";
 
-    // Determine which pattern is more likely
-    if (HTTTH_count > HTHTH_count) {
-        cout << "HTTTH is more likely." << endl;
-    } else if (HTHTH_count > HTTTH_count) {
-        cout << "HTHTH is more likely." << endl;
-    } else {
-        cout << "Both are equally likely." << endl;
-    }
-
+    pthread_exit(NULL);
     return 0;
 }
