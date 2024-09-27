@@ -1,36 +1,31 @@
-// triangle_search_cuda.cu
-
 #include <iostream>
+#include <map>
+#include <cmath>
 #include <chrono>
 #include <cuda_runtime.h>
 
-// CUDA kernel fonksiyonu
-__global__ void triangle_kernel(unsigned long long max_perimeter, unsigned long long* d_counter) {
-    unsigned long long idx = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned long long total_threads = gridDim.x * blockDim.x;
+#define MAX_PERIMETER 100000000
 
-    unsigned long long max_a = max_perimeter / 3;
+// CUDA kernel for counting triangles (to be parallelized)
+__global__ void countTriangles(int* d_validCount, int perimeter) {
+    int a = blockIdx.x * blockDim.x + threadIdx.x + 1;
+    
+    if (a < perimeter / 3) {
+        for (int b = a; b < (perimeter - a) / 2; ++b) {
+            int c = perimeter - a - b;
+            
+            // Ensure triangle inequality holds
+            if (c >= b && a + b > c && a + c > b && b + c > a) {
+                // Calculate the ratio (a+b)(a+c)/bc using trial division
+                int ab = a + b;
+                int ac = a + c;
+                int bc = b * c;
 
-    for (unsigned long long a = idx + 1; a <= max_a; a += total_threads) {
-        unsigned long long max_b = (max_perimeter - a) / 2;
-        for (unsigned long long b = a; b <= max_b; ++b) {
-            unsigned long long c_min = b;
-            unsigned long long c_max = max_perimeter - a - b;
-
-            if (a + b > c_min) {
-                if (a + b <= c_max) {
-                    c_max = a + b - 1;
-                }
-
-                for (unsigned long long c = c_min; c <= c_max; ++c) {
-                    unsigned long long numerator = (a + b) * (a + c);
-                    unsigned long long denominator = b * c;
-
-                    if (denominator == 0) continue;
-
-                    if (numerator % denominator == 0) {
-                        atomicAdd(d_counter, 1ULL);
-                    }
+                // Check if (ab * ac) % (bc) == 0
+                if ((ab * ac) % bc == 0) {
+                    atomicAdd(d_validCount, 1);
+                    // Debugging: Print the valid triangles
+                    printf("Valid Triangle: a = %d, b = %d, c = %d\n", a, b, c);
                 }
             }
         }
@@ -38,39 +33,45 @@ __global__ void triangle_kernel(unsigned long long max_perimeter, unsigned long 
 }
 
 int main() {
-    const unsigned long long max_perimeter = 100000000ULL;
-    unsigned long long valid_triangle_count = 0;
-    unsigned long long* d_counter;
+    int perimeter;
+    std::cout << "Enter the perimeter limit: ";
+    std::cin >> perimeter;
 
-    // Zaman ölçümünü başlat
-    auto start_time = std::chrono::high_resolution_clock::now();
+    if (perimeter < 3) {
+        std::cout << "Invalid perimeter!" << std::endl;
+        return 0;
+    }
 
-    // GPU belleğinde sayaç için yer ayırma
-    cudaMalloc(&d_counter, sizeof(unsigned long long));
-    cudaMemset(d_counter, 0, sizeof(unsigned long long));
+    int numTriangles = 0;
 
-    // Blok ve iş parçacığı sayısını belirleme
+    // Allocate memory on the device
+    int* d_validCount;
+    cudaMalloc(&d_validCount, sizeof(int));
+    cudaMemset(d_validCount, 0, sizeof(int));
+
+    // Set up timing
+    auto start = std::chrono::high_resolution_clock::now();
+
+    // Launch CUDA kernel
     int threadsPerBlock = 256;
-    int blocksPerGrid = 256;
+    int numBlocks = (perimeter / 3 + threadsPerBlock - 1) / threadsPerBlock;
+    countTriangles<<<numBlocks, threadsPerBlock>>>(d_validCount, perimeter);
 
-    // CUDA kernel fonksiyonunu çağırma
-    triangle_kernel<<<blocksPerGrid, threadsPerBlock>>>(max_perimeter, d_counter);
-
-    // GPU işlemlerinin tamamlanmasını bekleme
+    // Synchronize to wait for all threads to finish
     cudaDeviceSynchronize();
 
-    // Sonucu CPU'ya kopyalama
-    cudaMemcpy(&valid_triangle_count, d_counter, sizeof(unsigned long long), cudaMemcpyDeviceToHost);
+    // Copy result back to host
+    cudaMemcpy(&numTriangles, d_validCount, sizeof(int), cudaMemcpyDeviceToHost);
 
-    // GPU belleğini serbest bırakma
-    cudaFree(d_counter);
+    // Free device memory
+    cudaFree(d_validCount);
 
-    // Zaman ölçümünü bitir
-    auto end_time = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> elapsed = end_time - start_time;
+    // Stop timing
+    auto stop = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(stop - start);
 
-    std::cout << "Toplam geçerli üçgen sayısı: " << valid_triangle_count << std::endl;
-    std::cout << "Çalışma süresi: " << elapsed.count() << " saniye" << std::endl;
+    std::cout << "Number of valid triangles: " << numTriangles << std::endl;
+    std::cout << "Time taken: " << duration.count() << " ms" << std::endl;
 
     return 0;
 }
