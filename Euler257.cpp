@@ -6,6 +6,7 @@
 #include <chrono>
 #include <atomic>
 #include <unistd.h> // For sysconf to get hardware concurrency
+#include <thread>
 
 // Mutex for thread synchronization
 std::mutex mtx;
