@@ -1,104 +1,147 @@
 #include <iostream>
-#include <unordered_set>
-#include <tuple>
-#include <cmath>
-#include <chrono>
-#include <thread>
 #include <vector>
+#include <pthread.h>
 #include <mutex>
-#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <algorithm>
+#include <unistd.h>
 
-typedef long long ll;
-std::mutex triplet_mutex;  // Mutex to protect shared triplet data
+typedef unsigned long long ull;
 
-// Custom hash function for tuple of (a, b, c)
-struct hash_triplet {
-    std::size_t operator()(const std::tuple<ll, ll, ll>& triplet) const {
-        auto h1 = std::hash<ll>()(std::get<0>(triplet));
-        auto h2 = std::hash<ll>()(std::get<1>(triplet));
-        auto h3 = std::hash<ll>()(std::get<2>(triplet));
-        return h1 ^ (h2 << 1) ^ (h3 << 2);
-    }
+// Mutex for thread-safe operations
+std::mutex mtx;
+ull total_count = 0; // Total number of Cardano Triplets
+
+// Structure to pass data to threads
+struct ThreadData {
+    ull start_a;
+    ull end_a;
+    ull max_sum;
 };
 
-// Function to find valid Cardano Triplets (a, b, c) for a range of `a` values
-void find_cardano_triplets(ll start_a, ll limit, std::atomic<bool>& done, std::unordered_set<std::tuple<ll, ll, ll>, hash_triplet>& local_triplets, ll step) {
-    ll a = start_a;
-    while (!done.load()) {
-        ll u = (2 * a - 1) / 3;
-        if (u % 2 == 0) {
-            a += step;
-            continue;  // u must be odd
+// Function to factorize n and store the exponents of prime factors
+void factorize(ull n, std::vector<std::pair<ull, ull>>& factors) {
+    for (ull i = 2; i * i <= n; ++i) {
+        ull count = 0;
+        while (n % i == 0) {
+            n /= i;
+            ++count;
         }
+        if (count > 0)
+            factors.emplace_back(i, count);
+    }
+    if (n > 1)
+        factors.emplace_back(n, 1);
+}
 
-        ll lhs = u * u * u + a * a;  // u^3 + a^2
-        bool found_triplet_for_a = false;  // Track whether at least one triplet was found for this value of a
+// Integer exponentiation
+ull int_pow(ull base, ull exp) {
+    ull result = 1;
+    while (exp > 0) {
+        if (exp & 1)
+            result *= base;
+        base *= base;
+        exp >>= 1;
+    }
+    return result;
+}
 
-        for (ll b = 1; b * b <= lhs; ++b) {
-            if (lhs % (b * b) == 0) {
-                ll c = lhs / (b * b);
-                if (a + b + c <= limit) {
-                    // Lock mutex to safely add the unique triplet to the shared container
-                    std::lock_guard<std::mutex> guard(triplet_mutex);
-                    local_triplets.insert(std::make_tuple(a, b, c));  // Add the triplet to the set
-                    found_triplet_for_a = true;
-                }
-            }
+// Recursive function to generate all possible (b, c) pairs
+void generate_bc(const std::vector<std::pair<ull, ull>>& factors, size_t idx, ull b, ull c, ull max_sum, ull a) {
+    if (idx == factors.size()) {
+        if (a + b + c <= max_sum && b > 0 && c > 0) {
+            std::lock_guard<std::mutex> lock(mtx);
+            total_count++;
         }
+        return;
+    }
 
-        // If no valid triplet was found for the current value of a and the sum exceeds the limit, we stop
-        if (!found_triplet_for_a && a > limit) {
-            done.store(true);  // Signal threads to stop
-            break;
-        }
+    // Distribute exponents between b^2 and c, exponents in b^2 must be even
+    ull p = factors[idx].first;
+    ull e = factors[idx].second;
 
-        a += step;  // Skip over other threads' values
+    ull max_k = e / 2;
+    for (ull k = 0; k <= max_k; ++k) {
+        ull b_new = b * int_pow(p, k);
+        ull c_new = c * int_pow(p, e - 2 * k);
+        generate_bc(factors, idx + 1, b_new, c_new, max_sum, a);
     }
 }
 
+// Function executed by each thread to find Cardano Triplets
+void* find_cardano_triplets(void* arg) {
+    ThreadData* data = (ThreadData*)arg;
+    ull start_a = data->start_a;
+    ull end_a = data->end_a;
+    ull max_sum = data->max_sum;
+
+    for (ull a = start_a; a <= end_a; a += 3) { // a ≡ 2 mod 3
+        ull N = (1 + a) * (1 + a) * (8 * a - 1);
+        if (N % 27 != 0)
+            continue;
+        ull N_div = N / 27;
+
+        // Factorize N_div
+        std::vector<std::pair<ull, ull>> factors;
+        factorize(N_div, factors);
+
+        // Generate all possible (b, c) pairs
+        generate_bc(factors, 0, 1, 1, max_sum, a);
+    }
+
+    return nullptr;
+}
+
 int main() {
-    // Start measuring time
+    ull max_sum;
+    std::cout << "Enter the maximum value for (a + b + c): ";
+    std::cin >> max_sum;
+
     auto start_time = std::chrono::high_resolution_clock::now();
 
-    ll limit = 110000000;  // The sum a + b + c must be less than or equal to this limit
-    std::atomic<bool> done(false);
+    // Determine the number of hardware threads available
+    unsigned int num_threads = sysconf(_SC_NPROCESSORS_ONLN);
+    if (num_threads == 0)
+        num_threads = 4; // Default to 4 if unable to determine
 
-    // Get the number of hardware threads available
-    unsigned int num_threads = std::thread::hardware_concurrency();
-    if (num_threads == 0) num_threads = 4;  // Default to 4 if the system cannot determine it
+    std::cout << "Number of threads: " << num_threads << std::endl;
 
-    // Each thread will have its own local set of triplets
-    std::vector<std::unordered_set<std::tuple<ll, ll, ll>, hash_triplet>> thread_triplets(num_threads);
+    // Estimate MAX_A based on max_sum
+    ull MAX_A = max_sum; // Conservative estimate
 
-    std::vector<std::thread> threads;
+    ull range = MAX_A / num_threads + 1; // Ensure full coverage
 
-    // Launch multiple threads with different starting points for `a`
-    ll step = num_threads * 3;
+    // Create pthreads
+    std::vector<pthread_t> threads(num_threads);
+    std::vector<ThreadData> thread_data(num_threads);
+
     for (unsigned int i = 0; i < num_threads; ++i) {
-        ll thread_start_a = 2 + 3 * i;  // Each thread starts with a different value of `a`
-        threads.emplace_back(find_cardano_triplets, thread_start_a, limit, std::ref(done), std::ref(thread_triplets[i]), step);
+        ull start_a = 2 + i * range;
+        if (start_a % 3 != 2)
+            start_a += (3 - (start_a % 3) + 2) % 3; // Adjust to a ≡ 2 mod 3
+        ull end_a = std::min(start_a + range - 1, MAX_A);
+
+        if (start_a > end_a)
+            continue;
+
+        thread_data[i].start_a = start_a;
+        thread_data[i].end_a = end_a;
+        thread_data[i].max_sum = max_sum;
+
+        pthread_create(&threads[i], nullptr, find_cardano_triplets, &thread_data[i]);
     }
 
-    // Join all threads to ensure they complete execution
-    for (auto& th : threads) {
-        if (th.joinable()) {
-            th.join();
-        }
+    // Join threads
+    for (unsigned int i = 0; i < num_threads; ++i) {
+        pthread_join(threads[i], nullptr);
     }
 
-    // Combine results from all threads
-    std::unordered_set<std::tuple<ll, ll, ll>, hash_triplet> triplets;
-    for (const auto& local_triplets : thread_triplets) {
-        triplets.insert(local_triplets.begin(), local_triplets.end());
-    }
-
-    // Output the total number of unique triplets found
-    std::cout << "Number of unique Cardano Triplets: " << triplets.size() << std::endl;
-
-    // End measuring time
     auto end_time = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> diff = end_time - start_time;
-    std::cout << "Execution time: " << diff.count() << " seconds" << std::endl;
+    std::chrono::duration<double> elapsed_seconds = end_time - start_time;
+
+    std::cout << "Total Cardano Triplets: " << total_count << std::endl;
+    std::cout << "Elapsed time: " << elapsed_seconds.count() << " seconds\n";
 
     return 0;
 }
