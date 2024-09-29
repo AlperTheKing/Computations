@@ -6,12 +6,12 @@
 #include <cmath>
 #include <algorithm>
 #include <unistd.h>
+#include <atomic>
 
 typedef unsigned long long ull;
 
-// Mutex for thread-safe operations
-std::mutex mtx;
-ull total_count = 0; // Total number of Cardano Triplets
+// Atomic variable for thread-safe operations
+std::atomic<ull> total_count(0); // Total number of Cardano Triplets
 
 // Structure to pass data to threads
 struct ThreadData {
@@ -20,7 +20,7 @@ struct ThreadData {
     ull max_sum;
 };
 
-// Function to factorize n and store the exponents of prime factors
+// Function to factorize n and store the exponents of prime factors using trial division
 void factorize(ull n, std::vector<std::pair<ull, ull>>& factors) {
     for (ull i = 2; i * i <= n; ++i) {
         ull count = 0;
@@ -48,11 +48,11 @@ ull int_pow(ull base, ull exp) {
 }
 
 // Recursive function to generate all possible (b, c) pairs
-void generate_bc(const std::vector<std::pair<ull, ull>>& factors, size_t idx, ull b, ull c, ull max_sum, ull a) {
+void generate_bc(const std::vector<std::pair<ull, ull>>& factors, size_t idx,
+                 ull b, ull c, ull max_sum, ull a) {
     if (idx == factors.size()) {
         if (a + b + c <= max_sum && b > 0 && c > 0) {
-            std::lock_guard<std::mutex> lock(mtx);
-            total_count++;
+            total_count.fetch_add(1, std::memory_order_relaxed);
         }
         return;
     }
@@ -82,7 +82,7 @@ void* find_cardano_triplets(void* arg) {
             continue;
         ull N_div = N / 27;
 
-        // Factorize N_div
+        // Factorize N_div using trial division
         std::vector<std::pair<ull, ull>> factors;
         factorize(N_div, factors);
 
@@ -140,7 +140,7 @@ int main() {
     auto end_time = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> elapsed_seconds = end_time - start_time;
 
-    std::cout << "Total Cardano Triplets: " << total_count << std::endl;
+    std::cout << "Total Cardano Triplets: " << total_count.load() << std::endl;
     std::cout << "Elapsed time: " << elapsed_seconds.count() << " seconds\n";
 
     return 0;
