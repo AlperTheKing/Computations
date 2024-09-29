@@ -1,38 +1,45 @@
 #include <iostream>
 #include <vector>
-#include <pthread.h>
-#include <mutex>
+#include <thread>
+#include <atomic>
 #include <chrono>
 #include <cmath>
-#include <algorithm>
-#include <unistd.h>
-#include <atomic>
 
 typedef unsigned long long ull;
 
-// Atomic variable for thread-safe operations
 std::atomic<ull> total_count(0); // Total number of Cardano Triplets
 
-// Structure to pass data to threads
-struct ThreadData {
-    ull start_a;
-    ull end_a;
-    ull max_sum;
-};
+// Function to generate a list of primes using the Sieve of Eratosthenes
+std::vector<ull> sieve(ull max_n) {
+    std::vector<bool> is_prime(max_n + 1, true);
+    std::vector<ull> primes;
+    is_prime[0] = is_prime[1] = false;
 
-// Function to factorize n and store the exponents of prime factors using trial division
-void factorize(ull n, std::vector<std::pair<ull, ull>>& factors) {
-    for (ull i = 2; i * i <= n; ++i) {
+    for (ull i = 2; i <= max_n; ++i) {
+        if (is_prime[i]) {
+            primes.push_back(i);
+            for (ull j = i * i; j <= max_n; j += i)
+                is_prime[j] = false;
+        }
+    }
+    return primes;
+}
+
+// Function to factorize n using precomputed primes
+void factorize(ull n, const std::vector<ull>& primes, std::vector<std::pair<ull, ull>>& factors) {
+    for (ull prime : primes) {
+        if (prime * prime > n)
+            break;
         ull count = 0;
-        while (n % i == 0) {
-            n /= i;
+        while (n % prime == 0) {
+            n /= prime;
             ++count;
         }
         if (count > 0)
-            factors.emplace_back(i, count);
+            factors.emplace_back(prime, count);
     }
     if (n > 1)
-        factors.emplace_back(n, 1);
+        factors.emplace_back(n, 1); // n is prime
 }
 
 // Integer exponentiation
@@ -48,8 +55,7 @@ ull int_pow(ull base, ull exp) {
 }
 
 // Recursive function to generate all possible (b, c) pairs
-void generate_bc(const std::vector<std::pair<ull, ull>>& factors, size_t idx,
-                 ull b, ull c, ull max_sum, ull a) {
+void generate_bc(const std::vector<std::pair<ull, ull>>& factors, size_t idx, ull b, ull c, ull max_sum, ull a) {
     if (idx == factors.size()) {
         if (a + b + c <= max_sum && b > 0 && c > 0) {
             total_count.fetch_add(1, std::memory_order_relaxed);
@@ -69,28 +75,21 @@ void generate_bc(const std::vector<std::pair<ull, ull>>& factors, size_t idx,
     }
 }
 
-// Function executed by each thread to find Cardano Triplets
-void* find_cardano_triplets(void* arg) {
-    ThreadData* data = (ThreadData*)arg;
-    ull start_a = data->start_a;
-    ull end_a = data->end_a;
-    ull max_sum = data->max_sum;
-
+// Function to find Cardano Triplets in a given range of 'a'
+void find_cardano_triplets(ull start_a, ull end_a, ull max_sum, const std::vector<ull>& primes) {
     for (ull a = start_a; a <= end_a; a += 3) { // a ≡ 2 mod 3
         ull N = (1 + a) * (1 + a) * (8 * a - 1);
         if (N % 27 != 0)
             continue;
         ull N_div = N / 27;
 
-        // Factorize N_div using trial division
+        // Factorize N_div using precomputed primes
         std::vector<std::pair<ull, ull>> factors;
-        factorize(N_div, factors);
+        factorize(N_div, primes, factors);
 
         // Generate all possible (b, c) pairs
         generate_bc(factors, 0, 1, 1, max_sum, a);
     }
-
-    return nullptr;
 }
 
 int main() {
@@ -100,10 +99,14 @@ int main() {
 
     auto start_time = std::chrono::high_resolution_clock::now();
 
+    // Generate primes up to the square root of the largest possible N
+    ull max_prime = static_cast<ull>(std::sqrt((1 + max_sum) * (1 + max_sum) * (8 * max_sum - 1) / 27));
+    std::vector<ull> primes = sieve(max_prime);
+
     // Determine the number of hardware threads available
-    unsigned int num_threads = sysconf(_SC_NPROCESSORS_ONLN);
+    unsigned int num_threads = std::thread::hardware_concurrency();
     if (num_threads == 0)
-        num_threads = 4; // Default to 4 if unable to determine
+        num_threads = 4; // Default to 4 if hardware_concurrency cannot determine
 
     std::cout << "Number of threads: " << num_threads << std::endl;
 
@@ -111,10 +114,7 @@ int main() {
     ull MAX_A = max_sum; // Conservative estimate
 
     ull range = MAX_A / num_threads + 1; // Ensure full coverage
-
-    // Create pthreads
-    std::vector<pthread_t> threads(num_threads);
-    std::vector<ThreadData> thread_data(num_threads);
+    std::vector<std::thread> threads;
 
     for (unsigned int i = 0; i < num_threads; ++i) {
         ull start_a = 2 + i * range;
@@ -125,16 +125,11 @@ int main() {
         if (start_a > end_a)
             continue;
 
-        thread_data[i].start_a = start_a;
-        thread_data[i].end_a = end_a;
-        thread_data[i].max_sum = max_sum;
-
-        pthread_create(&threads[i], nullptr, find_cardano_triplets, &thread_data[i]);
+        threads.emplace_back(find_cardano_triplets, start_a, end_a, max_sum, std::ref(primes));
     }
 
-    // Join threads
-    for (unsigned int i = 0; i < num_threads; ++i) {
-        pthread_join(threads[i], nullptr);
+    for (auto& t : threads) {
+        t.join();
     }
 
     auto end_time = std::chrono::high_resolution_clock::now();
