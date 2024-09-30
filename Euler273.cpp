@@ -7,12 +7,19 @@
 #include <omp.h>
 #include <chrono>
 
-// Structure to store pairs of (a, b)
-struct Solution {
-    __int128 N;
-    int a;
-    int b;
-};
+// Helper function to convert __int128 to string
+std::string int128_to_string(__int128 value) {
+    if (value == 0) return "0";
+    std::string result;
+    bool negative = value < 0;
+    if (negative) value = -value;
+    while (value > 0) {
+        result.insert(result.begin(), '0' + (value % 10));
+        value /= 10;
+    }
+    if (negative) result.insert(result.begin(), '-');
+    return result;
+}
 
 // Function to find sum of two squares for a prime of the form 4k + 1
 std::vector<std::pair<int, int>> sum_of_two_squares(int p) {
@@ -60,8 +67,8 @@ std::vector<std::pair<int, int>> combine_squares(const std::pair<int, int>& p1, 
     return combinations;
 }
 
-// Generate all square-free N values and corresponding pairs of (a, b)
-void generate_square_free_N(const std::vector<int>& primes, std::vector<Solution>& solutions) {
+// Generate all square-free N values and write results to file
+void generate_square_free_N(const std::vector<int>& primes, std::ofstream& file, __int128& total_sum_of_a) {
     size_t num_primes = primes.size();
 
     #pragma omp parallel for schedule(dynamic)
@@ -92,25 +99,18 @@ void generate_square_free_N(const std::vector<int>& primes, std::vector<Solution
 
         #pragma omp critical
         {
-            // Store all unique solutions
+            // Store all unique solutions directly to file to avoid memory overflow
+            std::unordered_set<std::string> seen_pairs;
             for (const auto& comb : current_combinations) {
-                solutions.push_back({N, std::min(comb.first, comb.second), std::max(comb.first, comb.second)});
+                std::string pair_str = std::to_string(std::min(comb.first, comb.second)) + "," + std::to_string(std::max(comb.first, comb.second));
+                if (seen_pairs.find(pair_str) == seen_pairs.end()) {
+                    file << "N = " << int128_to_string(N) << ", a = " << comb.first << ", b = " << comb.second << std::endl;
+                    seen_pairs.insert(pair_str); // Mark the pair as seen
+                    total_sum_of_a += comb.first;  // Accumulate the sum of a's
+                }
             }
         }
     }
-}
-
-std::string int128_to_string(__int128 value) {
-    if (value == 0) return "0";
-    std::string result;
-    bool negative = value < 0;
-    if (negative) value = -value;
-    while (value > 0) {
-        result.insert(result.begin(), '0' + (value % 10));
-        value /= 10;
-    }
-    if (negative) result.insert(result.begin(), '-');
-    return result;
 }
 
 int main() {
@@ -130,28 +130,11 @@ int main() {
         return 1;
     }
 
-    // Store solutions for square-free N
-    std::vector<Solution> solutions;
-    __int128 total_sum_of_a = 0;  // Variable to store the total sum of a's
+    // Variable to store the total sum of a's
+    __int128 total_sum_of_a = 0;
 
-    // Generate all square-free N values using combinations of primes
-    generate_square_free_N(primes, solutions);
-
-    // Sort the solutions by N in ascending order
-    std::sort(solutions.begin(), solutions.end(), [](const Solution& s1, const Solution& s2) {
-        return s1.N < s2.N;
-    });
-
-    // Write sorted solutions to the file and calculate the total sum of a's
-    std::unordered_set<std::string> seen_pairs;
-    for (const auto& sol : solutions) {
-        std::string pair_str = std::to_string(sol.a) + "," + std::to_string(sol.b);
-        if (seen_pairs.find(pair_str) == seen_pairs.end()) {
-            file << "N = " << int128_to_string(sol.N) << ", a = " << sol.a << ", b = " << sol.b << std::endl;
-            seen_pairs.insert(pair_str); // Mark the pair as seen
-            total_sum_of_a += sol.a;  // Accumulate the sum of a's
-        }
-    }
+    // Generate all square-free N values and write directly to file
+    generate_square_free_N(primes, file, total_sum_of_a);
 
     // Stop measuring time
     auto end_time = std::chrono::high_resolution_clock::now();
@@ -165,8 +148,8 @@ int main() {
     file.close();
 
     // Output results
-    std::cout << "Found " << solutions.size() << " solutions in " << elapsed.count() << " seconds." << std::endl;
     std::cout << "Total sum of a values: " << int128_to_string(total_sum_of_a) << std::endl;
+    std::cout << "Elapsed time: " << elapsed.count() << " seconds." << std::endl;
 
     return 0;
 }
