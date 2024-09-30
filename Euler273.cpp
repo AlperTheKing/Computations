@@ -2,70 +2,104 @@
 #include <vector>
 #include <cmath>
 #include <fstream>
+#include <algorithm>
+#include <unordered_set>
 #include <omp.h>
 #include <chrono>
-#include <algorithm>
-#include <string>
 
-// Structure to store solutions and N for sorting later
+// Structure to store pairs of (a, b)
 struct Solution {
     __int128 N;
     int a;
     int b;
-    std::string factorization;
 };
 
-// Function to check if a number is prime
-bool is_prime(int n) {
-    if (n < 2) return false;
-    for (int i = 2; i <= std::sqrt(n); i++) {
-        if (n % i == 0) return false;
+// Function to find sum of two squares for a prime of the form 4k + 1
+std::vector<std::pair<int, int>> sum_of_two_squares(int p) {
+    std::vector<std::pair<int, int>> results;
+    for (int a = 1; a <= std::sqrt(p); ++a) {
+        int b_squared = p - a * a;
+        int b = std::sqrt(b_squared);
+        if (b * b == b_squared) {
+            results.emplace_back(a, b);  // Return all valid pairs (a, b)
+        }
     }
-    return true;
+    return results;
 }
 
-// Generate primes of the form 4k + 1
-std::vector<int> generate_primes(int limit) {
+// Generate primes of the form 4k + 1 using sieve of Eratosthenes
+std::vector<int> sieve_of_eratosthenes(int limit) {
+    std::vector<bool> is_prime(limit + 1, true);
     std::vector<int> primes;
-    for (int i = 5; i <= limit; i += 4) {
-        if (is_prime(i)) {
-            primes.push_back(i);
+
+    is_prime[0] = is_prime[1] = false;
+
+    for (int i = 2; i <= limit; ++i) {
+        if (is_prime[i]) {
+            if (i % 4 == 1) {
+                primes.push_back(i);
+            }
+            for (int j = 2 * i; j <= limit; j += i) {
+                is_prime[j] = false;
+            }
         }
     }
     return primes;
 }
 
-// Generate all square-free N values by taking combinations of primes
-void generate_square_free_N(const std::vector<int>& primes, std::vector<__int128>& square_free_N) {
+// Use composition law to combine two sums of squares in multiple ways
+std::vector<std::pair<int, int>> combine_squares(const std::pair<int, int>& p1, const std::pair<int, int>& p2) {
+    std::vector<std::pair<int, int>> combinations;
+    int a1 = p1.first, b1 = p1.second;
+    int a2 = p2.first, b2 = p2.second;
+
+    // All combinations of signs for (a1*a2 - b1*b2, a1*b2 + a2*b1)
+    combinations.emplace_back(std::abs(a1 * a2 - b1 * b2), std::abs(a1 * b2 + a2 * b1));
+    combinations.emplace_back(std::abs(a1 * a2 + b1 * b2), std::abs(a1 * b2 - a2 * b1));
+
+    return combinations;
+}
+
+// Generate all square-free N values and corresponding pairs of (a, b)
+void generate_square_free_N(const std::vector<int>& primes, std::vector<Solution>& solutions) {
     size_t num_primes = primes.size();
-    // Use combinations of primes (powerset), except the empty set
+
+    #pragma omp parallel for schedule(dynamic)
     for (size_t i = 1; i < (1 << num_primes); ++i) {
         __int128 N = 1;
-        std::string factorization = "";
+        std::vector<std::vector<std::pair<int, int>>> factors;
+        
+        // For each subset of primes, calculate the product and factorize using Gaussian integers
         for (size_t j = 0; j < num_primes; ++j) {
             if (i & (1 << j)) {
                 N *= primes[j];
-                if (!factorization.empty()) factorization += "*";
-                factorization += std::to_string(primes[j]);
+                factors.push_back(sum_of_two_squares(primes[j]));
             }
         }
-        square_free_N.push_back(N);
+
+        // Now combine all factors using the composition law in multiple ways
+        std::vector<std::pair<int, int>> current_combinations = factors[0];
+        for (size_t k = 1; k < factors.size(); ++k) {
+            std::vector<std::pair<int, int>> new_combinations;
+            for (const auto& comb1 : current_combinations) {
+                for (const auto& comb2 : factors[k]) {
+                    auto combined = combine_squares(comb1, comb2);
+                    new_combinations.insert(new_combinations.end(), combined.begin(), combined.end());
+                }
+            }
+            current_combinations = new_combinations;
+        }
+
+        #pragma omp critical
+        {
+            // Store all unique solutions
+            for (const auto& comb : current_combinations) {
+                solutions.push_back({N, std::min(comb.first, comb.second), std::max(comb.first, comb.second)});
+            }
+        }
     }
 }
 
-// Newton's method to compute the integer square root of n for __int128
-__int128 integer_sqrt(__int128 n) {
-    if (n == 0) return 0;
-    __int128 x = n;
-    __int128 y = (x + 1) / 2;
-    while (y < x) {
-        x = y;
-        y = (x + n / x) / 2;
-    }
-    return x;
-}
-
-// Helper function to print __int128 values
 std::string int128_to_string(__int128 value) {
     if (value == 0) return "0";
     std::string result;
@@ -79,22 +113,6 @@ std::string int128_to_string(__int128 value) {
     return result;
 }
 
-// Find all solutions to a^2 + b^2 = N and store them in a vector for later sorting
-void find_solutions(__int128 N, const std::vector<int>& primes, std::vector<Solution>& solutions, __int128 &sum_of_a) {
-    for (int a = 0; static_cast<__int128>(a) * a <= N; ++a) {
-        __int128 b_squared = N - static_cast<__int128>(a) * a;
-        __int128 b = integer_sqrt(b_squared);
-        if (b * b == b_squared && a <= b) {
-            std::string factorization = int128_to_string(N);  // Record N's factorization
-            #pragma omp critical
-            {
-                solutions.push_back({N, a, static_cast<int>(b), factorization});
-            }
-            sum_of_a += a;  // Accumulate the sum of 'a' values
-        }
-    }
-}
-
 int main() {
     // Start measuring time
     auto start_time = std::chrono::high_resolution_clock::now();
@@ -102,8 +120,8 @@ int main() {
     // Limit for primes of the form 4k + 1
     int prime_limit = 150;
 
-    // Generate primes of the form 4k + 1
-    std::vector<int> primes = generate_primes(prime_limit);
+    // Generate primes of the form 4k + 1 using sieve
+    std::vector<int> primes = sieve_of_eratosthenes(prime_limit);
 
     // Output file
     std::ofstream file("SumofSquares.txt");
@@ -112,47 +130,43 @@ int main() {
         return 1;
     }
 
-    // Generate all square-free N values using combinations of primes
-    std::vector<__int128> square_free_N;
-    generate_square_free_N(primes, square_free_N);
-
-    std::cout << "Generated " << square_free_N.size() << " square-free N values." << std::endl;
-
-    // Store solutions for sorting later
+    // Store solutions for square-free N
     std::vector<Solution> solutions;
-    __int128 total_sum_of_a = 0;  // To track the total sum of all 'a' values
+    __int128 total_sum_of_a = 0;  // Variable to store the total sum of a's
 
-    // Parallelize the computation to find solutions for each N
-    #pragma omp parallel for reduction(+:total_sum_of_a)
-    for (size_t i = 0; i < square_free_N.size(); ++i) {
-        __int128 N = square_free_N[i];
-        find_solutions(N, primes, solutions, total_sum_of_a);
-    }
+    // Generate all square-free N values using combinations of primes
+    generate_square_free_N(primes, solutions);
 
     // Sort the solutions by N in ascending order
     std::sort(solutions.begin(), solutions.end(), [](const Solution& s1, const Solution& s2) {
         return s1.N < s2.N;
     });
 
-    // Write sorted solutions to the file
+    // Write sorted solutions to the file and calculate the total sum of a's
+    std::unordered_set<std::string> seen_pairs;
     for (const auto& sol : solutions) {
-        file << "N = " << int128_to_string(sol.N) << " (" << sol.factorization << "), a = " << sol.a << ", b = " << sol.b << std::endl;
+        std::string pair_str = std::to_string(sol.a) + "," + std::to_string(sol.b);
+        if (seen_pairs.find(pair_str) == seen_pairs.end()) {
+            file << "N = " << int128_to_string(sol.N) << ", a = " << sol.a << ", b = " << sol.b << std::endl;
+            seen_pairs.insert(pair_str); // Mark the pair as seen
+            total_sum_of_a += sol.a;  // Accumulate the sum of a's
+        }
     }
 
     // Stop measuring time
     auto end_time = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> elapsed = end_time - start_time;
 
-    // Write total sum of 'a' values and elapsed time to the file
+    // Write the total sum of a's and the elapsed time to the file
     file << "Total sum of a values: " << int128_to_string(total_sum_of_a) << std::endl;
     file << "Elapsed time: " << elapsed.count() << " seconds" << std::endl;
 
     // Close the file
     file.close();
 
-    // Print the total sum of 'a' values to the console (since this is the main goal)
+    // Output results
+    std::cout << "Found " << solutions.size() << " solutions in " << elapsed.count() << " seconds." << std::endl;
     std::cout << "Total sum of a values: " << int128_to_string(total_sum_of_a) << std::endl;
-    std::cout << "Elapsed time: " << elapsed.count() << " seconds" << std::endl;
 
     return 0;
 }
