@@ -1,11 +1,12 @@
 #include <iostream>
 #include <vector>
-#include <cmath>
 #include <fstream>
-#include <algorithm>
+#include <map>
 #include <unordered_set>
 #include <omp.h>
 #include <chrono>
+#include <cmath>
+#include <cstdint>
 
 // Helper function to convert __int128 to string
 std::string int128_to_string(__int128 value) {
@@ -21,38 +22,24 @@ std::string int128_to_string(__int128 value) {
     return result;
 }
 
-// Function to find sum of two squares for a prime of the form 4k + 1
-std::vector<std::pair<int, int>> sum_of_two_squares(int p) {
-    std::vector<std::pair<int, int>> results;
-    for (int a = 1; a <= std::sqrt(p); ++a) {
-        int b_squared = p - a * a;
-        int b = std::sqrt(b_squared);
-        if (b * b == b_squared) {
-            results.emplace_back(a, b);  // Return all valid pairs (a, b)
-        }
+// Newton's method to compute square root of S using only integers
+__int128 newton_sqrt(__int128 S) {
+    if (S == 0) return 0;
+    __int128 x = S;
+    __int128 precision = 1;  // Precision for integers
+    while (true) {
+        __int128 next_x = (x + S / x) / 2;
+        if (abs(next_x - x) < precision) return next_x;
+        x = next_x;
     }
-    return results;
 }
 
-// Generate primes of the form 4k + 1 using sieve of Eratosthenes
-std::vector<int> sieve_of_eratosthenes(int limit) {
-    std::vector<bool> is_prime(limit + 1, true);
-    std::vector<int> primes;
-
-    is_prime[0] = is_prime[1] = false;
-
-    for (int i = 2; i <= limit; ++i) {
-        if (is_prime[i]) {
-            if (i % 4 == 1) {
-                primes.push_back(i);
-            }
-            for (int j = 2 * i; j <= limit; j += i) {
-                is_prime[j] = false;
-            }
-        }
-    }
-    return primes;
-}
+// Precomputed primes of the form 4k+1 and their a^2 + b^2 representations (a <= b enforced)
+const std::vector<int> primes = {5, 13, 17, 29, 37, 41, 53, 61, 73, 89, 97, 101, 109, 113, 137, 149};
+const std::vector<std::pair<int, int>> prime_factors = {
+    {1, 2}, {2, 3}, {1, 4}, {2, 5}, {1, 6}, {4, 5}, {2, 7}, {5, 6}, {3, 8}, {5, 8}, {4, 9},
+    {1, 10}, {6, 7}, {7, 8}, {2, 11}, {5, 12}
+};
 
 // Use composition law to combine two sums of squares in multiple ways
 std::vector<std::pair<int, int>> combine_squares(const std::pair<int, int>& p1, const std::pair<int, int>& p2) {
@@ -64,11 +51,29 @@ std::vector<std::pair<int, int>> combine_squares(const std::pair<int, int>& p1, 
     combinations.emplace_back(std::abs(a1 * a2 - b1 * b2), std::abs(a1 * b2 + a2 * b1));
     combinations.emplace_back(std::abs(a1 * a2 + b1 * b2), std::abs(a1 * b2 - a2 * b1));
 
+    // Ensure a <= b
+    for (auto& comb : combinations) {
+        if (comb.first > comb.second) std::swap(comb.first, comb.second);
+    }
+
     return combinations;
 }
 
-// Generate all square-free N values and write results to file
-void generate_square_free_N(const std::vector<int>& primes, std::ofstream& file, __int128& total_sum_of_a) {
+// Validate a^2 + b^2 = N using Newton's method for square root
+bool validate_pair(int a, __int128 N) {
+    // Calculate N - a^2
+    __int128 N_minus_a2 = N - __int128(a) * a;
+    if (N_minus_a2 < 0) return false;  // If N - a^2 < 0, no valid b exists
+    
+    // Calculate b using Newton's method
+    __int128 b = newton_sqrt(N_minus_a2);
+    
+    // Check if b is an integer and satisfies b^2 + a^2 = N
+    return (b * b == N_minus_a2);
+}
+
+// Generate all square-free N values and store results in a map sorted by N
+void generate_square_free_N(std::map<__int128, std::vector<std::pair<int, int>>>& result_map) {
     size_t num_primes = primes.size();
 
     #pragma omp parallel for schedule(dynamic)
@@ -76,11 +81,11 @@ void generate_square_free_N(const std::vector<int>& primes, std::ofstream& file,
         __int128 N = 1;
         std::vector<std::vector<std::pair<int, int>>> factors;
         
-        // For each subset of primes, calculate the product and factorize using Gaussian integers
+        // For each subset of primes, calculate the product and factorize using precomputed values
         for (size_t j = 0; j < num_primes; ++j) {
             if (i & (1 << j)) {
                 N *= primes[j];
-                factors.push_back(sum_of_two_squares(primes[j]));
+                factors.push_back({prime_factors[j]});  // Use precomputed (a, b) pairs
             }
         }
 
@@ -99,14 +104,15 @@ void generate_square_free_N(const std::vector<int>& primes, std::ofstream& file,
 
         #pragma omp critical
         {
-            // Store all unique solutions directly to file to avoid memory overflow
+            // Store all unique solutions in a map sorted by N
             std::unordered_set<std::string> seen_pairs;
             for (const auto& comb : current_combinations) {
-                std::string pair_str = std::to_string(std::min(comb.first, comb.second)) + "," + std::to_string(std::max(comb.first, comb.second));
-                if (seen_pairs.find(pair_str) == seen_pairs.end()) {
-                    file << "N = " << int128_to_string(N) << ", a = " << comb.first << ", b = " << comb.second << std::endl;
-                    seen_pairs.insert(pair_str); // Mark the pair as seen
-                    total_sum_of_a += comb.first;  // Accumulate the sum of a's
+                if (validate_pair(comb.first, N)) {  // Validate (a, b) pair using new approach
+                    std::string pair_str = std::to_string(std::min(comb.first, comb.second)) + "," + std::to_string(std::max(comb.first, comb.second));
+                    if (seen_pairs.find(pair_str) == seen_pairs.end()) {
+                        result_map[N].push_back({comb.first, comb.second});
+                        seen_pairs.insert(pair_str); // Mark the pair as seen
+                    }
                 }
             }
         }
@@ -117,24 +123,31 @@ int main() {
     // Start measuring time
     auto start_time = std::chrono::high_resolution_clock::now();
 
-    // Limit for primes of the form 4k + 1
-    int prime_limit = 150;
+    // Map to store results sorted by N (std::map keeps keys in sorted order)
+    std::map<__int128, std::vector<std::pair<int, int>>> result_map;
 
-    // Generate primes of the form 4k + 1 using sieve
-    std::vector<int> primes = sieve_of_eratosthenes(prime_limit);
+    // Generate all square-free N values and store in the map
+    generate_square_free_N(result_map);
 
     // Output file
-    std::ofstream file("SumofSquares.txt");
+    std::ofstream file("SumofSquares_Sorted.txt");
     if (!file.is_open()) {
-        std::cerr << "Error: Unable to open file SumofSquares.txt for writing." << std::endl;
+        std::cerr << "Error: Unable to open file SumofSquares_Sorted.txt for writing." << std::endl;
         return 1;
     }
 
     // Variable to store the total sum of a's
     __int128 total_sum_of_a = 0;
 
-    // Generate all square-free N values and write directly to file
-    generate_square_free_N(primes, file, total_sum_of_a);
+    // Write results sorted by N to the file
+    for (const auto& entry : result_map) {
+        file << "N = " << int128_to_string(entry.first) << " : ";
+        for (const auto& pair : entry.second) {
+            file << "(" << pair.first << "," << pair.second << ") ";
+            total_sum_of_a += pair.first;  // Accumulate the sum of a's
+        }
+        file << std::endl;
+    }
 
     // Stop measuring time
     auto end_time = std::chrono::high_resolution_clock::now();
