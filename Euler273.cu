@@ -2,70 +2,62 @@
 #include <vector>
 #include <cmath>
 #include <cuda_runtime.h>
-#include <chrono>
-#include <algorithm>
 #include <fstream>
+#include <chrono>
+#include <set>
+#include <map>
+#include <algorithm>
+#include <string>
+#include <cstring>
 
-// Structure to store pairs of (a, b) with the corresponding N
-struct Solution {
-    long long N;
-    int a;
-    int b;
-};
+// Declare primes in host and __constant__ for device
+int h_primes[] = {5, 13, 17, 29, 37, 41, 53, 61, 73, 89, 97, 101, 109, 113, 137, 149};
+__constant__ int primes[16];  // Max 16 primes
+const int num_primes = sizeof(h_primes) / sizeof(h_primes[0]);
 
-// CUDA kernel to compute sum of two squares for a given N
-__global__ void sum_of_two_squares(long long* Ns, int* a_results, int* b_results, int num_Ns) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_Ns) return;
+// Bitwise method to compute integer square root of a non-negative integer n
+__device__ int int_sqrt(int n) {
+    int res = 0;
+    int bit = 1 << 30; // Largest power of 4 less than the maximum integer (2^30)
 
-    long long N = Ns[idx];
-    for (int a = 1; a * a <= N; ++a) {
-        long long b_squared = N - static_cast<long long>(a) * a;
-        int b = static_cast<int>(sqrtf(b_squared));
-        if (b * b == b_squared) {
-            a_results[idx] = a;
-            b_results[idx] = b;
-            return;
-        }
+    // Find the largest bit that's smaller or equal to the number
+    while (bit > n) {
+        bit >>= 2;
     }
-    a_results[idx] = -1;  // No solution found
-    b_results[idx] = -1;
+
+    // Compute the integer square root
+    while (bit != 0) {
+        if (n >= res + bit) {
+            n -= res + bit;
+            res = (res >> 1) + bit;
+        } else {
+            res >>= 1;
+        }
+        bit >>= 2;
+    }
+
+    return res;
 }
 
-// Function to generate primes of the form 4k + 1 using sieve of Eratosthenes
-std::vector<int> sieve_of_eratosthenes(int limit) {
-    std::vector<bool> is_prime(limit + 1, true);
-    std::vector<int> primes;
-    is_prime[0] = is_prime[1] = false;
-    for (int i = 2; i <= limit; ++i) {
-        if (is_prime[i]) {
-            if (i % 4 == 1) {
-                primes.push_back(i);
-            }
-            for (int j = 2 * i; j <= limit; j += i) {
-                is_prime[j] = false;
-            }
-        }
-    }
-    return primes;
-}
+// CUDA kernel for finding Gaussian integer pairs (a, b) for a given prime p
+__global__ void find_gaussian_pairs(int p, int* a_results, int* b_results, int* count) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx >= p) return;
 
-// Generate all non-empty combinations of primes and calculate the product
-void generate_prime_combinations(const std::vector<int>& primes, std::vector<long long>& Ns) {
-    size_t num_primes = primes.size();
-    for (size_t i = 1; i < (1 << num_primes); ++i) {
-        long long N = 1;
-        for (size_t j = 0; j < num_primes; ++j) {
-            if (i & (1 << j)) {
-                N *= primes[j];
-            }
-        }
-        Ns.push_back(N);
+    int a = idx;
+    int b_squared = p - a * a;
+    if (b_squared < 0) return;
+
+    int b = int_sqrt(b_squared);  // Use bitwise integer square root
+    if (b * b == b_squared && a <= b) {
+        int pos = atomicAdd(count, 1);  // Atomic addition to get a unique position
+        a_results[pos] = a;
+        b_results[pos] = b;
     }
 }
 
-// Helper function to print long long values as string
-std::string long_long_to_string(long long value) {
+// Custom function to convert __int128 to string
+std::string int128_to_string(__int128 value) {
     if (value == 0) return "0";
     std::string result;
     bool negative = value < 0;
@@ -78,98 +70,150 @@ std::string long_long_to_string(long long value) {
     return result;
 }
 
-int main() {
-    // Start measuring time
-    auto start_time = std::chrono::high_resolution_clock::now();
+// Function to combine two sets of Gaussian integer pairs (a1, b1) and (a2, b2)
+// Ensures that 0 <= a <= b for each resulting pair
+std::set<std::pair<int, int>> combine_gaussian_pairs(const std::set<std::pair<int, int>>& pairs1,
+                                                     const std::set<std::pair<int, int>>& pairs2) {
+    std::set<std::pair<int, int>> result;
+    for (const auto& [a1, b1] : pairs1) {
+        for (const auto& [a2, b2] : pairs2) {
+            // Consider both (a1*a2 - b1*b2, a1*b2 + a2*b1) and (a1*a2 + b1*b2, a1*b2 - a2*b1) combinations
+            int a_plus = abs(a1 * a2 - b1 * b2);
+            int b_plus = abs(a1 * b2 + a2 * b1);
+            result.emplace(std::min(a_plus, b_plus), std::max(a_plus, b_plus));  // Ensure 0 <= a <= b
 
-    // Limit for primes of the form 4k + 1
-    int prime_limit = 150;
+            int a_minus = abs(a1 * a2 + b1 * b2);
+            int b_minus = abs(a1 * b2 - a2 * b1);
+            result.emplace(std::min(a_minus, b_minus), std::max(a_minus, b_minus));  // Ensure 0 <= a <= b
+        }
+    }
+    return result;
+}
 
-    // Generate primes of the form 4k + 1 using sieve
-    std::vector<int> primes = sieve_of_eratosthenes(prime_limit);
+// Host function to find Gaussian integer pairs for a prime p
+std::vector<std::pair<int, int>> find_gaussian_pairs_host(int p, int* d_a_results, int* d_b_results, int* d_count) {
+    std::vector<std::pair<int, int>> pairs;
 
-    // Generate all non-empty combinations of primes
-    std::vector<long long> Ns;
-    generate_prime_combinations(primes, Ns);
-    int num_Ns = Ns.size();
+    int count = 0;
+    int max_pairs = p;  // Max possible pairs can't exceed p
 
-    // Allocate memory for results (a and b values)
-    long long* d_Ns;
-    int* d_a_results;
-    int* d_b_results;
-    int* a_results = new int[num_Ns];
-    int* b_results = new int[num_Ns];
+    cudaMemcpy(d_count, &count, sizeof(int), cudaMemcpyHostToDevice);
 
-    cudaMalloc(&d_Ns, num_Ns * sizeof(long long));
-    cudaMalloc(&d_a_results, num_Ns * sizeof(int));
-    cudaMalloc(&d_b_results, num_Ns * sizeof(int));
+    // Determine optimal block and grid sizes
+    int blockSize = 0; // Optimal block size
+    int minGridSize = 0; // Minimum grid size to achieve maximum occupancy
+    cudaOccupancyMaxPotentialBlockSize(&minGridSize, &blockSize, find_gaussian_pairs, 0, p);
 
-    cudaMemcpy(d_Ns, Ns.data(), num_Ns * sizeof(long long), cudaMemcpyHostToDevice);
-
-    // Determine optimal block and grid sizes using cudaOccupancyMaxPotentialBlockSize
-    int minGridSize, blockSize;
-    cudaOccupancyMaxPotentialBlockSize(&minGridSize, &blockSize, sum_of_two_squares, 0, num_Ns);
-    int gridSize = (num_Ns + blockSize - 1) / blockSize;
+    int gridSize = (p + blockSize - 1) / blockSize;
 
     // Launch the kernel
-    sum_of_two_squares<<<gridSize, blockSize>>>(d_Ns, d_a_results, d_b_results, num_Ns);
+    find_gaussian_pairs<<<gridSize, blockSize>>>(p, d_a_results, d_b_results, d_count);
     cudaDeviceSynchronize();
 
-    // Copy results back to host
-    cudaMemcpy(a_results, d_a_results, num_Ns * sizeof(int), cudaMemcpyDeviceToHost);
-    cudaMemcpy(b_results, d_b_results, num_Ns * sizeof(int), cudaMemcpyDeviceToHost);
+    // Copy the results back to host
+    int* a_results = new int[max_pairs];
+    int* b_results = new int[max_pairs];
+    cudaMemcpy(&count, d_count, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(a_results, d_a_results, count * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(b_results, d_b_results, count * sizeof(int), cudaMemcpyDeviceToHost);
 
-    // Store solutions for square-free N
-    std::vector<Solution> solutions;
-
-    for (int i = 0; i < num_Ns; ++i) {
-        if (a_results[i] != -1 && b_results[i] != -1) {
-            solutions.push_back({Ns[i], a_results[i], b_results[i]});
+    // Store the results in pairs
+    for (int i = 0; i < count; ++i) {
+        if (a_results[i] <= b_results[i]) {  // Ensure 0 <= a <= b
+            pairs.emplace_back(a_results[i], b_results[i]);
         }
     }
 
-    // Sort the solutions by N in ascending order
-    std::sort(solutions.begin(), solutions.end(), [](const Solution& s1, const Solution& s2) {
-        return s1.N < s2.N;
-    });
+    // Clean up
+    delete[] a_results;
+    delete[] b_results;
 
-    // Output to file
-    std::ofstream file("SumofSquares.txt");
-    if (!file.is_open()) {
+    return pairs;
+}
+
+// Host function to generate square-free N values and find Gaussian integer solutions
+void generate_gaussian_solutions(std::ofstream& output_file, __int128& total_sum_of_a, 
+                                 int* d_a_results, int* d_b_results, int* d_count) {
+    for (int mask = 1; mask < (1 << num_primes); ++mask) {
+        __int128 N = 1;
+        std::set<std::pair<int, int>> combined_pairs;
+        bool first = true;
+        std::string factors;
+
+        for (size_t i = 0; i < num_primes; ++i) {
+            if (mask & (1 << i)) {
+                N *= h_primes[i];  // Use host-side primes array
+                factors += (factors.empty() ? "" : "*") + std::to_string(h_primes[i]);
+                auto prime_pairs = find_gaussian_pairs_host(h_primes[i], d_a_results, d_b_results, d_count);
+                std::set<std::pair<int, int>> prime_pair_set(prime_pairs.begin(), prime_pairs.end());
+
+                if (first) {
+                    combined_pairs = prime_pair_set;
+                    first = false;
+                } else {
+                    combined_pairs = combine_gaussian_pairs(combined_pairs, prime_pair_set);
+                }
+            }
+        }
+
+        if (!combined_pairs.empty()) {
+            output_file << "N = " << int128_to_string(N) << " (" << factors << "): ";
+            for (const auto& [a, b] : combined_pairs) {
+                output_file << "(" << a << "," << b << ") ";
+                total_sum_of_a += a;  // Accumulate sum of a values
+            }
+            output_file << std::endl;
+        }
+    }
+}
+
+int main() {
+    // Copy primes to device constant memory
+    cudaMemcpyToSymbol(primes, h_primes, sizeof(h_primes));
+
+    // Measure overall execution time
+    auto start_time = std::chrono::high_resolution_clock::now();
+
+    // Allocate memory on device (reuse this across multiple kernel calls)
+    int* d_a_results;
+    int* d_b_results;
+    int* d_count;
+    int max_pairs = 149;  // Max prime value in the list
+    cudaMalloc(&d_a_results, max_pairs * sizeof(int));
+    cudaMalloc(&d_b_results, max_pairs * sizeof(int));
+    cudaMalloc(&d_count, sizeof(int));
+
+    // Open the output file to write the results (SumofSquares.txt)
+    std::ofstream output_file("SumofSquares.txt");
+    if (!output_file.is_open()) {
         std::cerr << "Error: Unable to open file SumofSquares.txt for writing." << std::endl;
         return 1;
     }
 
-    long long total_sum_of_a = 0;
+    // Variable to store the total sum of all 'a' values
+    __int128 total_sum_of_a = 0;
 
-    // Write sorted solutions to the file and calculate the total sum of a's
-    for (const auto& sol : solutions) {
-        file << "N = " << long_long_to_string(sol.N) << ", a = " << sol.a << ", b = " << sol.b << std::endl;
-        total_sum_of_a += sol.a;  // Accumulate the sum of a's
-    }
-
-    // Stop measuring time
-    auto end_time = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> elapsed = end_time - start_time;
-
-    // Write the total sum of a's and the elapsed time to the file
-    file << "Total sum of a values: " << long_long_to_string(total_sum_of_a) << std::endl;
-    file << "Elapsed time: " << elapsed.count() << " seconds" << std::endl;
+    // Measure time for generating and finding Gaussian integer pairs
+    auto computation_start = std::chrono::high_resolution_clock::now();
+    generate_gaussian_solutions(output_file, total_sum_of_a, d_a_results, d_b_results, d_count);
+    auto computation_end = std::chrono::high_resolution_clock::now();
 
     // Close the file
-    file.close();
+    output_file.close();
 
-    // Free CUDA memory
-    cudaFree(d_Ns);
+    // Free device memory
     cudaFree(d_a_results);
     cudaFree(d_b_results);
+    cudaFree(d_count);
 
-    // Output results to console
-    std::cout << "Found " << solutions.size() << " solutions in " << elapsed.count() << " seconds." << std::endl;
-    std::cout << "Total sum of a values: " << total_sum_of_a << std::endl;
+    // Compute the elapsed time for computation
+    std::chrono::duration<double> computation_duration = computation_end - computation_start;
 
-    delete[] a_results;
-    delete[] b_results;
+    // Print the computation time
+    std::cout << "Computation time: " << computation_duration.count() << " seconds" << std::endl;
+
+    // Print the total sum of all 'a' values
+    std::cout << "Total sum of all 'a' values: " << int128_to_string(total_sum_of_a) << std::endl;
 
     return 0;
 }
