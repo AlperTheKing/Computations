@@ -2,105 +2,107 @@
 #include <vector>
 #include <string>
 #include <unordered_map>
+#include <algorithm>
 #include <chrono>
+#include <thread>
+#include <mutex>
+
+// Include Boost Multiprecision
 #include <boost/multiprecision/cpp_int.hpp>
 
+using namespace std;
 using namespace boost::multiprecision;
-using cpp_int = boost::multiprecision::cpp_int;
 
-// Precompute factorials of digits 0 to 9
-const std::vector<cpp_int> factorials = []() {
-    std::vector<cpp_int> f(10, 1);
-    for (int i = 1; i <= 9; ++i)
-        f[i] = f[i - 1] * i;
-    return f;
-}();
+const int MAX_SF = 150;
+const int MAX_DIGITS = 30;
+const vector<int> DIGITS = {1,2,3,4,5,6,7,8,9};
 
-const int MAX_I = 150; // Maximum value of i to compute
-std::vector<cpp_int> g_values(MAX_I + 1, 0);
-std::vector<int> sg_values(MAX_I + 1, 0);
+vector<cpp_int> factorials(10);
+mutex mtx;
+unordered_map<int, string> sf_n_min_n;
 
-void compute_g_sg() {
-    // dp[sum_fact] = minimal number n as string
-    std::unordered_map<cpp_int, std::string> dp;
-    dp[0] = ""; // Base case
+void computeFactorials() {
+    factorials[0] = 1;
+    for (int i = 1; i <= 9; ++i) {
+        factorials[i] = factorials[i - 1] * i;
+    }
+}
 
-    // Maximum number of digits to consider
-    const int max_digits = 200; // Adjusted to handle larger numbers
+int sumOfDigits(const cpp_int& n) {
+    int sum = 0;
+    cpp_int temp = n;
+    while (temp > 0) {
+        sum += static_cast<int>(temp % 10);
+        temp /= 10;
+    }
+    return sum;
+}
 
-    // Iterate over the number of digits
-    for (int digits = 1; digits <= max_digits; ++digits) {
-        std::unordered_map<cpp_int, std::string> new_dp;
+void generateCombinations(const string& currentDigits, int depth, int maxDepth, const cpp_int& currentF) {
+    if (depth > maxDepth) return;
 
-        // Iterate over possible digits (0 to 9)
-        for (int d = 0; d <= 9; ++d) {
-            // Skip leading zeros
-            if (digits == 1 && d == 0)
-                continue;
+    int sf_n = sumOfDigits(currentF);
 
-            cpp_int fact_d = factorials[d];
+    if (sf_n > MAX_SF) return;
 
-            for (const auto& [sum_fact, num_str] : dp) {
-                cpp_int new_sum_fact = sum_fact + fact_d;
-                std::string new_num_str = num_str + std::to_string(d);
+    // Sort digits to form minimal n
+    string n = currentDigits;
+    sort(n.begin(), n.end());
 
-                // Compute sf(n): sum of digits of new_sum_fact
-                cpp_int temp_sum_fact = new_sum_fact;
-                int sf_n = 0;
-                while (temp_sum_fact > 0) {
-                    sf_n += static_cast<int>(temp_sum_fact % 10);
-                    temp_sum_fact /= 10;
-                }
-
-                // Skip if sf_n exceeds MAX_I
-                if (sf_n > MAX_I)
-                    continue;
-
-                // Update g_values and sg_values
-                cpp_int n = cpp_int(new_num_str);
-                if (g_values[sf_n] == 0 || n < g_values[sf_n]) {
-                    g_values[sf_n] = n;
-                    // Compute sg(i): sum of digits of n
-                    int sg_i = 0;
-                    for (char c : new_num_str)
-                        sg_i += c - '0';
-                    sg_values[sf_n] = sg_i;
-                }
-
-                // Update new_dp
-                if (new_dp.find(new_sum_fact) == new_dp.end() || new_dp[new_sum_fact] > new_num_str) {
-                    new_dp[new_sum_fact] = new_num_str;
-                }
-            }
+    {
+        lock_guard<mutex> lock(mtx);
+        if (sf_n_min_n.find(sf_n) == sf_n_min_n.end() ||
+            n.length() < sf_n_min_n[sf_n].length() ||
+            (n.length() == sf_n_min_n[sf_n].length() && n < sf_n_min_n[sf_n])) {
+            sf_n_min_n[sf_n] = n;
         }
+    }
 
-        // Use new_dp for the next iteration
-        dp = std::move(new_dp);
+    for (int d : DIGITS) {
+        string newDigits = currentDigits + char('0' + d);
+        cpp_int newF = currentF + factorials[d];
+        generateCombinations(newDigits, depth + 1, maxDepth, newF);
     }
 }
 
 int main() {
-    // Start timing
-    auto start_time = std::chrono::high_resolution_clock::now();
+    auto startTime = chrono::high_resolution_clock::now();
 
-    // Start computation
-    compute_g_sg();
+    computeFactorials();
 
-    // End timing
-    auto end_time = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> execution_time = end_time - start_time;
+    const int NUM_THREADS = thread::hardware_concurrency();
+    vector<thread> threads;
 
-    // Calculate total sg(i)
-    cpp_int total_sg = 0;
-    for (int i = 1; i <= MAX_I; ++i) {
-        if (g_values[i] != 0) {
-            total_sg += sg_values[i];
-            std::cout << "g(" << i << ") = " << g_values[i] << ", sg(" << i << ") = " << sg_values[i] << std::endl;
+    for (int d : DIGITS) {
+        threads.emplace_back([d]() {
+            string initialDigit(1, '0' + d);
+            cpp_int initialF = factorials[d];
+            generateCombinations(initialDigit, 1, MAX_DIGITS, initialF);
+        });
+    }
+
+    for (thread& t : threads) {
+        t.join();
+    }
+
+    int total_sg = 0;
+    for (int i = 1; i <= MAX_SF; ++i) {
+        if (sf_n_min_n.find(i) != sf_n_min_n.end()) {
+            string n = sf_n_min_n[i];
+            int sg = 0;
+            for (char c : n) {
+                sg += c - '0';
+            }
+            total_sg += sg;
+            cout << "i = " << i << ", g(i) = " << n << ", sg(i) = " << sg << endl;
         }
     }
 
-    std::cout << "\nTotal execution time: " << execution_time.count() << " seconds" << std::endl;
-    std::cout << "The sum of sg(i) for 1 <= i <= " << MAX_I << " is: " << total_sg << std::endl;
+    cout << "Total sum of sg(i) for i from 1 to " << MAX_SF << " is " << total_sg << endl;
+
+    auto endTime = chrono::high_resolution_clock::now();
+    chrono::duration<double> duration = endTime - startTime;
+    cout << "Time taken: " << duration.count() << " seconds" << endl;
 
     return 0;
 }
