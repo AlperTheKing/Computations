@@ -1,53 +1,72 @@
+#include <gmp.h>
 #include <iostream>
 #include <cmath>
 #include <thread>
 #include <mutex>
-#include <boost/multiprecision/cpp_int.hpp>
+#include <vector>
 #include <chrono>
 
-using namespace boost::multiprecision;
 using namespace std;
 using namespace std::chrono;
 
-using boost_int = cpp_int;
-
 std::mutex sum_mutex;
-boost_int total_sum = 0;
+mpz_t total_sum;
 
 void compute_heronian(int max_ratio, int start, int end) {
+    mpz_t a, b, c, perimeter, s_p, area_squared, area, temp1, temp2;
+    mpz_inits(a, b, c, perimeter, s_p, area_squared, area, temp1, temp2, NULL);
+
     for (int p = start; p <= end; ++p) {
-        for (int w1 = 1; w1 <= 20; ++w1) {
-            for (int s = 1; s <= 20; ++s) {
-                for (int t = 1; t <= 20; ++t) {
-                    for (int u = 1; u <= 20; ++u) {
-                        for (int v = 1; v <= 20; ++v) {
-                            for (int alpha = 1; alpha <= 20; ++alpha) {
-                                for (int beta = 1; beta <= 20; ++beta) {
-                                    for (int gamma = 1; gamma <= 20; ++gamma) {
-                                        // Calculate the sides of the triangle
-                                        boost_int a = p * alpha * u * ((beta * w1 * v) * (beta * w1 * v) + (gamma * s * t) * (gamma * s * t));
-                                        boost_int b = p * beta * s * ((alpha * w1 * t) * (alpha * w1 * t) + (gamma * u * v) * (gamma * u * v));
-                                        boost_int c = p * (beta * u * v * v + alpha * s * t * t) * (beta * alpha * w1 * w1 - gamma * gamma * s * u);
+        for (int w1 = 1; w1 <= 18; ++w1) {
+            for (int s = 1; s <= 18; ++s) {
+                for (int t = 1; t <= 18; ++t) {
+                    for (int u = 1; u <= 18; ++u) {
+                        for (int v = 1; v <= 18; ++v) {
+                            for (int alpha = 1; alpha <= 18; ++alpha) {
+                                for (int beta = 1; beta <= 18; ++beta) {
+                                    for (int gamma = 1; gamma <= 18; ++gamma) {
+                                        // Calculate a, b, c (sides of the triangle)
+                                        mpz_set_ui(a, p);
+                                        mpz_mul_ui(a, a, alpha * u * ((beta * w1 * v) * (beta * w1 * v) + (gamma * s * t) * (gamma * s * t)));
 
-                                        boost_int perimeter = a + b + c;
+                                        mpz_set_ui(b, p);
+                                        mpz_mul_ui(b, b, beta * s * ((alpha * w1 * t) * (alpha * w1 * t) + (gamma * u * v) * (gamma * u * v)));
 
-                                        // Calculate the semi-perimeter for Heron's formula
-                                        boost_int s_p = perimeter / 2;
+                                        mpz_set_ui(c, p);
+                                        mpz_mul_ui(c, c, (beta * u * v * v + alpha * s * t * t) * (beta * alpha * w1 * w1 - gamma * gamma * s * u));
 
-                                        // Calculate the area using Heron's formula
-                                        boost_int area_squared = s_p * (s_p - a) * (s_p - b) * (s_p - c);
+                                        // Calculate perimeter
+                                        mpz_add(perimeter, a, b);
+                                        mpz_add(perimeter, perimeter, c);
 
-                                        if (area_squared > 0) {
-                                            boost_int area = sqrt(area_squared);
+                                        // Calculate semi-perimeter
+                                        mpz_fdiv_q_ui(s_p, perimeter, 2);
 
-                                            // Check the area-to-perimeter ratio
-                                            if (area % perimeter == 0) {
-                                                boost_int ratio = area / perimeter;
-                                                if (ratio <= max_ratio) {
-                                                    // Lock and update total sum if the ratio condition is met
+                                        // Calculate area using Heron's formula
+                                        mpz_sub(temp1, s_p, a); // temp1 = s_p - a
+                                        mpz_sub(temp2, s_p, b); // temp2 = s_p - b
+                                        mpz_mul(area_squared, temp1, temp2); // area_squared = temp1 * temp2
+
+                                        mpz_sub(temp1, s_p, c); // temp1 = s_p - c
+                                        mpz_mul(area_squared, area_squared, temp1); // area_squared *= temp1
+                                        mpz_mul(area_squared, area_squared, s_p);   // area_squared *= s_p
+
+                                        if (mpz_cmp_ui(area_squared, 0) > 0) {
+                                            mpz_sqrt(area, area_squared);
+
+                                            // Check area-to-perimeter ratio
+                                            if (mpz_divisible_p(area, perimeter)) {
+                                                mpz_t ratio;
+                                                mpz_init(ratio);
+                                                mpz_divexact(ratio, area, perimeter);
+
+                                                if (mpz_cmp_ui(ratio, max_ratio) <= 0) {
+                                                    // Add to total sum (protected by mutex)
                                                     std::lock_guard<std::mutex> lock(sum_mutex);
-                                                    total_sum += perimeter;
+                                                    mpz_add(total_sum, total_sum, perimeter);
                                                 }
+
+                                                mpz_clear(ratio);
                                             }
                                         }
                                     }
@@ -59,6 +78,8 @@ void compute_heronian(int max_ratio, int start, int end) {
             }
         }
     }
+
+    mpz_clears(a, b, c, perimeter, s_p, area_squared, area, temp1, temp2, NULL);
 }
 
 int main() {
@@ -66,14 +87,17 @@ int main() {
     const int num_threads = std::thread::hardware_concurrency();
     vector<thread> threads;
 
+    mpz_init(total_sum);
+    mpz_set_ui(total_sum, 0);  // Initialize total_sum to 0
+
     // Start timing
     auto start_time = high_resolution_clock::now();
 
     // Divide the work dynamically between threads
-    int range_per_thread = 20 / num_threads;  // Assuming range for 'p' is from 1 to 20
+    int range_per_thread = 18 / num_threads;  // Assuming range for 'p' is from 1 to 18
     for (int i = 0; i < num_threads; ++i) {
         int start = i * range_per_thread + 1;
-        int end = (i == num_threads - 1) ? 20 : (i + 1) * range_per_thread;
+        int end = (i == num_threads - 1) ? 18 : (i + 1) * range_per_thread;
         threads.emplace_back(compute_heronian, max_ratio, start, end);
     }
 
@@ -86,8 +110,16 @@ int main() {
     auto end_time = high_resolution_clock::now();
     auto duration = duration_cast<seconds>(end_time - start_time);
 
-    cout << "Total sum of perimeters: " << total_sum << endl;
+    // Output total sum
+    cout << "Total sum of perimeters: ";
+    mpz_out_str(stdout, 10, total_sum);
+    cout << endl;
+
+    // Output time taken
     cout << "Time taken: " << duration.count() << " seconds" << endl;
+
+    // Clear GMP variables
+    mpz_clear(total_sum);
 
     return 0;
 }
