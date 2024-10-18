@@ -1,149 +1,123 @@
 #include <iostream>
-#include <chrono>
-#include <cstdint>
-#include <thread>
 #include <vector>
+#include <algorithm>
+#include <thread>
 #include <mutex>
+#include <map>
+#include <set>
+#include <numeric>
+#include <chrono>
+#include <boost/multiprecision/cpp_int.hpp>
 
-using namespace std;
+namespace mp = boost::multiprecision;
 
-// Function to check if a triangle with sides a, b, c is valid
-bool isValidTriangle(int64_t a, int64_t b, int64_t c) {
-    return (a + b > c && a + c > b && b + c > a);
+std::mutex mtx;           // Mutex for updating total perimeter sum
+std::mutex set_mtx;       // Mutex for updating the set of unique triangles
+const int MAX_RATIO = 1000; // The maximum allowed area-to-perimeter ratio
+mp::cpp_int total_perimeter_sum = 0; // Global total perimeter sum
+
+// Set to store unique triangles
+std::set<std::tuple<mp::cpp_int, mp::cpp_int, mp::cpp_int>> unique_triangles;
+
+// Function to compute GCD of two integers
+int gcd(int a, int b) {
+    return std::gcd(a, b);
 }
 
-// Function to compute 16 * Area^2 using integer Heron's formula
-int64_t compute16AreaSquared(int64_t a, int64_t b, int64_t c) {
-    int64_t s = a + b + c;
-    int64_t s_minus_2a = s - 2LL * a;
-    int64_t s_minus_2b = s - 2LL * b;
-    int64_t s_minus_2c = s - 2LL * c;
-    return s * s_minus_2a * s_minus_2b * s_minus_2c;
-}
+// Function to calculate Heronian triangles using Euler's parametrization
+void euler_heronian(int start_m, int end_m) {
+    // Thread-local storage for unique triangles and local perimeter sum
+    std::map<std::tuple<mp::cpp_int, mp::cpp_int, mp::cpp_int>, mp::cpp_int> local_triangles;
 
-// Function to perform computation for a range of k values
-void computePerimeterSum(int64_t k_start, int64_t k_end, int64_t& partialSum, mutex& mtx) {
-    int64_t localSum = 0;
+    for (int m = start_m; m <= end_m; ++m) {
+        for (int n = 1; n < m; ++n) {
+            if (gcd(m, n) != 1) continue; // Ensure gcd(m, n) = 1
 
-    for (int64_t k = k_start; k <= k_end; ++k) {
-        // Based on observations, we can set bounds for x
-        // Let's assume x ranges from k to some multiple of k
-        int64_t x_start = k;
-        int64_t x_end = 4 * k * k + 1000; // Adjust as needed
+            for (int p = 1; p <= m; ++p) {
+                for (int q = 1; q < p; ++q) {
+                    if (gcd(p, q) != 1) continue; // Ensure gcd(p, q) = 1
 
-        for (int64_t x = x_start; x <= x_end; ++x) {
-            for (int64_t y = x; y <= x_end; ++y) {
-                // Compute numerator and denominator to solve for z
-                int64_t numerator = 16LL * k * k * (x + y);
-                int64_t denominator = x * y - 16LL * k * k;
+                    // Apply Euler's parametrization formulas
+                    mp::cpp_int a = m * n * (p * p + q * q);
+                    mp::cpp_int b = p * q * (m * m + n * n);
+                    mp::cpp_int c = (m * q + n * p) * (m * p - n * q);
 
-                if (denominator <= 0)
-                    continue;
+                    // Ensure sides are positive
+                    if (a <= 0 || b <= 0 || c <= 0) continue;
 
-                if (numerator % denominator != 0)
-                    continue;
+                    mp::cpp_int perimeter = a + b + c;
+                    mp::cpp_int area = m * n * p * q * (m * q + n * p) * (m * p - n * q);
 
-                int64_t z = numerator / denominator;
-                if (z < y)
-                    continue;
+                    // Skip invalid cases
+                    if (area <= 0 || perimeter <= 0) continue;
 
-                // Verify the original equation
-                if (x * y * z != 16LL * k * k * (x + y + z))
-                    continue;
+                    // Ensure the area is exactly divisible by the perimeter
+                    if (area % perimeter != 0) continue;
 
-                // Compute perimeter P
-                int64_t P = x + y + z;
+                    mp::cpp_int ratio = area / perimeter;
+                    if (ratio > MAX_RATIO) continue;
 
-                // Compute sides a, b, c
-                int64_t a_times_2 = P - x;
-                int64_t b_times_2 = P - y;
-                int64_t c_times_2 = P - z;
+                    // Normalize the sides
+                    std::vector<mp::cpp_int> sides = {a, b, c};
+                    std::sort(sides.begin(), sides.end());
+                    auto triangle = std::make_tuple(sides[0], sides[1], sides[2]);
 
-                // Check if sides are integers
-                if (a_times_2 % 2 != 0 || b_times_2 % 2 != 0 || c_times_2 % 2 != 0)
-                    continue;
-
-                int64_t a = a_times_2 / 2;
-                int64_t b = b_times_2 / 2;
-                int64_t c = c_times_2 / 2;
-
-                // Check if sides are positive
-                if (a <= 0 || b <= 0 || c <= 0)
-                    continue;
-
-                // Check if sides form a valid triangle
-                if (!isValidTriangle(a, b, c))
-                    continue;
-
-                // Compute 16 * Area^2
-                int64_t areaSquared16 = compute16AreaSquared(a, b, c);
-
-                // Compute 16k^2 * P^2
-                int64_t expectedAreaSquared16 = 16LL * k * k * P * P;
-
-                // Verify that area squared matches expected value
-                if (areaSquared16 != expectedAreaSquared16)
-                    continue;
-
-                // Update the local sum
-                localSum += P;
-
-                // Optionally, print the found triangle
-                // Comment out to reduce console output and improve performance
-                
-                mtx.lock();
-                std::cout << "Found triangle with sides: " << a << ", " << b << ", " << c << ", k = " << k << std::endl;
-                std::cout << "Perimeter: " << P << std::endl;
-                mtx.unlock();
-                
+                    // Store in local map
+                    local_triangles[triangle] = perimeter;
+                }
             }
         }
     }
 
-    // Safely update the shared total sum
-    std::lock_guard<std::mutex> lock(mtx);
-    partialSum += localSum;
+    // Merge local results into global ones
+    {
+        std::lock_guard<std::mutex> lock(set_mtx);
+        for (const auto& [tri, perim] : local_triangles) {
+            if (unique_triangles.find(tri) == unique_triangles.end()) {
+                unique_triangles.insert(tri);
+                total_perimeter_sum += perim;
+            }
+        }
+    }
+}
+
+// Function to perform multithreading with dynamic load balancing
+void solve_with_multithreading() {
+    int num_threads = std::thread::hardware_concurrency();
+    if (num_threads == 0) num_threads = 1; // Fallback to single thread if hardware_concurrency() is not available
+
+    int max_m = 2000; // Estimate a reasonable upper limit for parameter m based on MAX_RATIO
+
+    std::vector<std::thread> threads;
+    int range = max_m / num_threads; // Divide work into ranges for each thread
+
+    for (int i = 0; i < num_threads; ++i) {
+        int start_m = i * range + 1;
+        int end_m = (i == num_threads - 1) ? max_m : (i + 1) * range;
+
+        threads.emplace_back(euler_heronian, start_m, end_m);
+    }
+
+    for (auto &t : threads) {
+        t.join(); // Wait for all threads to finish
+    }
 }
 
 int main() {
-    using namespace std::chrono;
+    // Start the clock using standard C++ chrono
+    auto start_time = std::chrono::high_resolution_clock::now();
 
-    auto start = high_resolution_clock::now();
+    // Solve the problem using multithreading
+    solve_with_multithreading();
 
-    const int64_t MAX_K = 1000;
-    int64_t totalPerimeterSum = 0;
+    // End the clock and calculate the elapsed time
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time).count();
 
-    // Determine the number of threads to use
-    unsigned int numThreads = std::thread::hardware_concurrency();
-    if (numThreads == 0)
-        numThreads = 4; // Default to 4 threads if hardware_concurrency returns 0
-
-    // Divide the k range among threads
-    int64_t k_per_thread = MAX_K / numThreads;
-    vector<thread> threads;
-    mutex mtx;
-
-    // Launch threads
-    int64_t k_current = 1;
-    for (unsigned int i = 0; i < numThreads; ++i) {
-        int64_t k_start = k_current;
-        int64_t k_end = (i == numThreads - 1) ? MAX_K : k_current + k_per_thread - 1;
-        k_current = k_end + 1;
-
-        threads.emplace_back(computePerimeterSum, k_start, k_end, std::ref(totalPerimeterSum), std::ref(mtx));
-    }
-
-    // Wait for all threads to finish
-    for (auto& th : threads) {
-        if (th.joinable())
-            th.join();
-    }
-
-    std::cout << "Total Sum of Perimeters: " << totalPerimeterSum << std::endl;
-
-    auto end = high_resolution_clock::now();
-    duration<double> elapsed = end - start;
-    std::cout << "Execution Time: " << elapsed.count() << " seconds" << std::endl;
+    // Output the result and the time taken
+    std::cout << "Total sum of perimeters: " << total_perimeter_sum << std::endl;
+    std::cout << "Number of unique triangles: " << unique_triangles.size() << std::endl;
+    std::cout << "Time taken: " << duration << " seconds" << std::endl;
 
     return 0;
 }
