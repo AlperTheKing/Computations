@@ -1,216 +1,129 @@
+// Complete C++ Code
 #include <iostream>
-#include <vector>
-#include <queue>
 #include <cmath>
-#include <chrono>
-#include <iomanip>
-#include <limits>
-#include <thread>
-#include <mutex>
-
-using namespace std;
-using namespace std::chrono;
-
-// Grid parameters
-const double GRID_STEP = 0.05;  // Adjusted grid resolution
-const int MAX_COORD = 1600;
-const int GRID_SIZE = MAX_COORD / GRID_STEP + 1;
-
-// Starting and ending grid indices
-const int AX = static_cast<int>(200 / GRID_STEP);
-const int AY = static_cast<int>(200 / GRID_STEP);
-const int BX = static_cast<int>(1400 / GRID_STEP);
-const int BY = static_cast<int>(1400 / GRID_STEP);
-
-// Movement directions and costs
-const int dx[8] = {1, -1, 0, 0, 1, 1, -1, -1};
-const int dy[8] = {0, 0, 1, -1, 1, -1, 1, -1};
-const double move_cost[8] = {GRID_STEP, GRID_STEP, GRID_STEP, GRID_STEP,
-                             GRID_STEP * sqrt(2), GRID_STEP * sqrt(2),
-                             GRID_STEP * sqrt(2), GRID_STEP * sqrt(2)};
-
-// Mutex for thread safety
-mutex mtx;
-
-// Function to compute h(x, y)
-double compute_h(int xi, int yi) {
-    double x = xi * GRID_STEP;
-    double y = yi * GRID_STEP;
-
-    double numerator = x * x + y * y + x * y;
-    double part1 = 5000.0 - numerator / 200.0 + 25.0 * pow(x + y, 2.0);
-    double exponent = -((x * x + y * y) / 1000000.0 - 3.0 * (x + y) / 2000.0 + 0.7);
-    double h = part1 * exp(exponent);
-    return h;
-}
-
-// Heuristic function for A* algorithm
-double heuristic(int xi, int yi) {
-    double x = xi * GRID_STEP;
-    double y = yi * GRID_STEP;
-    double bx = BX * GRID_STEP;
-    double by = BY * GRID_STEP;
-    return sqrt((x - bx) * (x - bx) + (y - by) * (y - by));
-}
-
-// Function to compute h(x, y) in parallel
-void compute_h_parallel(vector<vector<double>>& h, int start_row, int end_row, double& local_max_h, double& local_min_h, mutex& mtx) {
-    double local_max = -numeric_limits<double>::infinity();
-    double local_min = numeric_limits<double>::infinity();
-
-    for (int xi = start_row; xi < end_row; ++xi) {
-        for (int yi = 0; yi < GRID_SIZE; ++yi) {
-            h[xi][yi] = compute_h(xi, yi);
-            if (h[xi][yi] > local_max) local_max = h[xi][yi];
-            if (h[xi][yi] < local_min) local_min = h[xi][yi];
-        }
-    }
-
-    // Update global max and min h values
-    lock_guard<mutex> lock(mtx);
-    if (local_max > local_max_h) local_max_h = local_max;
-    if (local_min < local_min_h) local_min_h = local_min;
-}
+#include <functional>
+#include <boost/math/tools/minima.hpp>      // For finding local maxima/minima
+#include <boost/math/tools/roots.hpp>       // For root finding
+#include <boost/math/special_functions/lambert_w.hpp> // For Lambert W function
+#include <boost/math/quadrature/gauss_kronrod.hpp> // For numerical integration
 
 int main() {
-    auto start_time = high_resolution_clock::now();
+    // Block 1
+    auto h_function = [](double x, double y) {
+        double h = 1000.0 * (5.0 - 5.0 / 1e6 * (x * x + y * y + x * y) + 125.0 / 1e4 * (x + y))
+                   * std::exp(-std::abs(1.0 / 1e6 * (x * x + y * y) - 15.0 / 1e4 * (x + y) + 0.7));
+        return h;
+    };
 
-    // Step 1: Compute h(x, y) for all grid points in parallel
-    vector<vector<double>> h(GRID_SIZE, vector<double>(GRID_SIZE));
-    double max_h = -numeric_limits<double>::infinity();
-    double min_h = numeric_limits<double>::infinity();
+    // Variables
+    double u_l = 200.0 * std::sqrt(2.0);
+    double u_r = 1400.0 * std::sqrt(2.0);
 
-    int num_threads = thread::hardware_concurrency();
-    if (num_threads == 0) num_threads = 4;  // Default to 4 threads if hardware_concurrency() returns 0
-    vector<thread> threads;
-    int rows_per_thread = GRID_SIZE / num_threads;
+    // Finding the local maximum of h(y=0) between x = 0 and x = 1600
+    auto h_y0 = [&](double x) { return -h_function(x, 0.0); }; // Negative for maximization
+    boost::uintmax_t max_iter = 50;
+    std::pair<double, double> result = boost::math::tools::brent_find_minima(h_y0, 0.0, 1600.0, std::numeric_limits<double>::digits, max_iter);
+    double x_left = result.first;
+    double f_min = -result.second;
 
-    for (int t = 0; t < num_threads; ++t) {
-        int start_row = t * rows_per_thread;
-        int end_row = (t == num_threads - 1) ? GRID_SIZE : start_row + rows_per_thread;
-        threads.emplace_back(compute_h_parallel, ref(h), start_row, end_row, ref(max_h), ref(min_h), ref(mtx));
-    }
+    std::cout << "Local maximum of h(y=0) is at x = " << x_left << " with value = " << f_min << std::endl;
 
-    for (auto& th : threads) {
-        th.join();
-    }
+    // Block 3
+    auto A = [](double u) {
+        return 2.0 - 3.0 * u * u / 1e6 + std::sqrt(2.0) * u / 200.0;
+    };
 
-    // Step 2: Binary search to find f_min
-    double epsilon = 0.01;
-    double f_low = max(h[AX][AY], h[BX][BY]);  // Start from the max elevation between A and B
-    double f_high = max_h;
-    double f_min = max_h;
+    auto B = [](double u) {
+        return -u * u / 1e6 + 3.0 * std::sqrt(2.0) * u / 2000.0 - 0.7;
+    };
 
-    while (f_high - f_low > epsilon) {
-        double f_mid = (f_low + f_high) / 2.0;
+    // Define h3(u, v)
+    auto h3 = [&](double u, double v) {
+        double h3_val = (A(u) - v * v / 1e6) * std::exp(B(u) - v * v / 1e6) * 2500.0;
+        return h3_val;
+    };
 
-        // Check if both starting and ending points are below f_mid
-        if (h[AX][AY] <= f_mid && h[BX][BY] <= f_mid) {
-            // A* algorithm to check for path at elevation f_mid
-            vector<vector<double>> dist(GRID_SIZE, vector<double>(GRID_SIZE, numeric_limits<double>::infinity()));
-            priority_queue<pair<double, pair<int, int>>, vector<pair<double, pair<int, int>>>, greater<>> pq;
+    // Find the maximum height
+    auto h3_v0 = [&](double u) { return h3(u, 0.0); };
 
-            dist[AX][AY] = 0.0;
-            pq.push({heuristic(AX, AY), {AX, AY}});
+    boost::uintmax_t max_iter_h3 = 50;
+    std::pair<double, double> result_h3 = boost::math::tools::brent_find_minima(
+        [&](double u) { return -h3_v0(u); }, 0.0, 2000.0, std::numeric_limits<double>::digits, max_iter_h3);
+    double height_u = result_h3.first;
+    double height = h3_v0(height_u);
 
-            bool path_found = false;
+    std::cout << "Maximum height is at u = " << height_u << " with value = " << height << std::endl;
 
-            while (!pq.empty()) {
-                auto [current_f, point] = pq.top();
-                pq.pop();
-                int xi = point.first;
-                int yi = point.second;
+    // Block 2
+    // Define f_v(u)
+    auto f_v = [&](double u) {
+        double exp_part = std::exp(A(u) - B(u));
+        double lambert_input = height / 2500.0 * exp_part;
+        double W = boost::math::lambert_w0(lambert_input);
+        double fv = std::sqrt(A(u) - W) * 1000.0;
+        return fv;
+    };
 
-                double current_dist = current_f - heuristic(xi, yi);
+    // Derivative of f_v(u) (approximated numerically)
+    auto f_v_derivative = [&](double u) {
+        double h = 1e-6;
+        return (f_v(u + h) - f_v(u - h)) / (2 * h);
+    };
 
-                if (current_dist > dist[xi][yi]) continue;
+    // Define the functions to find roots x_L and x_R
+    auto func_L = [&](double u) {
+        return u - f_v(u) / f_v_derivative(u) - u_l;
+    };
 
-                if (xi == BX && yi == BY) {
-                    path_found = true;
-                    break;
-                }
+    auto func_R = [&](double u) {
+        return u - f_v(u) / f_v_derivative(u) - u_r;
+    };
 
-                for (int dir = 0; dir < 8; ++dir) {
-                    int nx = xi + dx[dir];
-                    int ny = yi + dy[dir];
-                    double edge_dist = move_cost[dir];
-                    if (nx >= 0 && nx < GRID_SIZE && ny >= 0 && ny < GRID_SIZE &&
-                        h[nx][ny] <= f_mid) {
-                        double new_dist = dist[xi][yi] + edge_dist;
-                        if (new_dist < dist[nx][ny]) {
-                            dist[nx][ny] = new_dist;
-                            pq.push({new_dist + heuristic(nx, ny), {nx, ny}});
-                        }
-                    }
-                }
-            }
+    // Find x_L and x_R using root-finding
+    boost::uintmax_t max_iter_root = 50;
+    double tol = 1e-6;
 
-            if (path_found) {
-                f_min = f_mid;
-                f_high = f_mid;
-            } else {
-                f_low = f_mid;
-            }
-        } else {
-            f_low = f_mid;
-        }
-    }
+    // Finding x_L
+    auto sol_L = boost::math::tools::toms748_solve(func_L, 387.0, 900.0, func_L(387.0), func_L(900.0),
+                                                   [tol](double min, double max) { return std::abs(max - min) <= tol; });
+    double x_L = (sol_L.first + sol_L.second) / 2.0;
 
-    // Step 3: Compute the shortest path at elevation f_min using A*
-    // Ensure that both starting and ending points are below f_min
-    if (h[AX][AY] <= f_min && h[BX][BY] <= f_min) {
-        vector<vector<double>> dist(GRID_SIZE, vector<double>(GRID_SIZE, numeric_limits<double>::infinity()));
-        priority_queue<pair<double, pair<int, int>>, vector<pair<double, pair<int, int>>>, greater<>> pq;
+    // Finding x_R
+    auto sol_R = boost::math::tools::toms748_solve(func_R, 1200.0, 1828.0, func_R(1200.0), func_R(1828.0),
+                                                   [tol](double min, double max) { return std::abs(max - min) <= tol; });
+    double x_R = (sol_R.first + sol_R.second) / 2.0;
 
-        dist[AX][AY] = 0.0;
-        pq.push({heuristic(AX, AY), {AX, AY}});
+    std::cout << "x_L = " << x_L << ", x_R = " << x_R << std::endl;
 
-        while (!pq.empty()) {
-            auto [current_f, point] = pq.top();
-            pq.pop();
-            int xi = point.first;
-            int yi = point.second;
+    // Compute ans
+    double ans = std::hypot(u_l - x_L, f_v(x_L)) + std::hypot(u_r - x_R, f_v(x_R));
+    ans += 1536.0161445693104;
 
-            double current_dist = current_f - heuristic(xi, yi);
+    std::cout << "ans = " << ans << std::endl;
 
-            if (current_dist > dist[xi][yi]) continue;
+    // Numerical integration
+    auto int_f = [&](double u) {
+        double derivative = f_v_derivative(u);
+        return std::sqrt(derivative * derivative + 1.0);
+    };
 
-            if (xi == BX && yi == BY) {
-                break;
-            }
+    double integral_result = boost::math::quadrature::gauss_kronrod<double, 15>::integrate(
+        int_f, x_L, x_R, 5, 1e-9);
 
-            for (int dir = 0; dir < 8; ++dir) {
-                int nx = xi + dx[dir];
-                int ny = yi + dy[dir];
-                double edge_dist = move_cost[dir];
-                if (nx >= 0 && nx < GRID_SIZE && ny >= 0 && ny < GRID_SIZE &&
-                    h[nx][ny] <= f_min) {
-                    double new_dist = dist[xi][yi] + edge_dist;
-                    if (new_dist < dist[nx][ny]) {
-                        dist[nx][ny] = new_dist;
-                        pq.push({new_dist + heuristic(nx, ny), {nx, ny}});
-                    }
-                }
+    std::cout << "Integral result = " << integral_result << std::endl;
+
+    // Optional plotting data output
+    /*
+    std::ofstream data_file("h3_height_data.txt");
+    for (double u = 0.0; u <= 2000.0; u += 10.0) {
+        for (double v = -1000.0; v <= 1000.0; v += 10.0) {
+            if (std::abs(h3(u, v) - height) < 1e-2) {
+                data_file << u << " " << v << std::endl;
             }
         }
-
-        double shortest_path_length = dist[BX][BY];
-
-        if (isinf(shortest_path_length)) {
-            cout << "No path found under the elevation f_min." << endl;
-        } else {
-            // Stop measuring time
-            auto end_time = high_resolution_clock::now();
-            duration<double> elapsed = end_time - start_time;
-
-            cout << fixed << setprecision(3);
-            cout << "Minimum elevation (f_min): " << f_min << endl;
-            cout << "Length of the shortest path: " << shortest_path_length << endl;
-            cout << "Execution time: " << elapsed.count() << " seconds" << endl;
-        }
-    } else {
-        cout << "Cannot find path under elevation f_min." << endl;
     }
+    data_file.close();
+    */
 
     return 0;
 }
