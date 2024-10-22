@@ -1,174 +1,175 @@
 #include <iostream>
 #include <vector>
-#include <thread>
 #include <chrono>
 #include <cuda_runtime.h>
-#include <mutex>
+#include <thread>
+#include <iomanip>
 
-#define CUDA_CALL(call) do { \
-    cudaError_t err = call; \
-    if(err != cudaSuccess) { \
-        std::cerr << "CUDA Error: " << cudaGetErrorString(err) << " at " << __FILE__ << ":" << __LINE__ << std::endl; \
-        exit(EXIT_FAILURE); \
-    } \
-} while(0)
+// ANSI color codes
+const std::string RESET = "\033[0m";
+const std::string BOLD_RED = "\033[1;31m";
+const std::string BOLD_GREEN = "\033[1;32m";
+const std::string BOLD_YELLOW = "\033[1;33m";
+const std::string BOLD_BLUE = "\033[1;34m";
 
-// CUDA Kernel for Collatz steps calculation
-__device__ int collatz_steps_device(long long n) {
-    int steps = 0;
-    while (n != 1) {
-        if (n & 1) {
-            n = 3 * n + 1;
-        } else {
-            n = n >> 1;
+struct uint128 {
+    unsigned long long low;
+    unsigned long long high;
+};
+
+__host__ __device__ uint128 add_uint128(uint128 a, uint128 b) {
+    uint128 result;
+    result.low = a.low + b.low;
+    result.high = a.high + b.high + (result.low < a.low);
+    return result;
+}
+
+__host__ __device__ uint128 mul_uint128(unsigned long long a, unsigned long long b) {
+    uint128 result;
+    unsigned __int128 full_result = static_cast<unsigned __int128>(a) * b;
+    result.low = static_cast<unsigned long long>(full_result);
+    result.high = static_cast<unsigned long long>(full_result >> 64);
+    return result;
+}
+
+__device__ void atomicMax_uint128(unsigned long long *d_max_steps, uint128 *d_number_with_max_steps, unsigned long long local_max_steps, uint128 local_number_with_max_steps) {
+    unsigned long long prev_max_steps = atomicMax(d_max_steps, local_max_steps);
+    __syncthreads();  // Ensure all threads see the updated max steps value
+    if (local_max_steps > prev_max_steps) {
+        atomicExch(&(d_number_with_max_steps->low), local_number_with_max_steps.low);
+        atomicExch(&(d_number_with_max_steps->high), local_number_with_max_steps.high);
+    }
+}
+
+__global__ void find_max_collatz_steps_in_range(uint128 start, uint128 end, unsigned long long *d_max_steps, uint128 *d_number_with_max_steps) {
+    unsigned long long local_max_steps = 0;
+    uint128 local_number_with_max_steps = start;
+
+    uint128 current = start;
+    current.low += blockIdx.x * blockDim.x + threadIdx.x;
+
+    while (current.low < end.low || current.high < end.high) {
+        unsigned long long steps = 0;
+        unsigned long long low = current.low;
+        unsigned long long high = current.high;
+        while (low != 1 || high != 0) {
+            if (high == 0) {  // Use 64-bit logic if within 64-bit range
+                if (low % 2 == 0) {
+                    low /= 2;
+                } else {
+                    low = 3 * low + 1;
+                }
+            } else {  // Use 128-bit logic if exceeding 64-bit range
+                if ((low & 1) == 0) {  // Even number
+                    low >>= 1;
+                    if (high & 1) {
+                        low |= (1ULL << 63);
+                    }
+                    high >>= 1;
+                } else {  // Odd number
+                    uint128 three_n = mul_uint128(low, 3);
+                    three_n.high += high * 3;
+                    current = add_uint128(three_n, {1, 0});
+                    low = current.low;
+                    high = current.high;
+                }
+            }
+            steps++;
         }
-        steps++;
+        if (steps > local_max_steps) {
+            local_max_steps = steps;
+            local_number_with_max_steps = current;
+        }
+        current.low += gridDim.x * blockDim.x;
+        if (current.low < blockIdx.x * blockDim.x + threadIdx.x) {
+            current.high++;
+        }
     }
-    return steps;
-}
 
-// Kernel to compute Collatz on GPU and find the max steps
-__global__ void collatz_kernel(long long start, long long end, int* d_max_steps, long long* d_max_number) {
-    long long index = blockIdx.x * blockDim.x + threadIdx.x;
-    long long num = start + index;
-
-    if (num >= end) return;  // Ensure the thread does not process out-of-bounds values
-
-    int steps = collatz_steps_device(num);
-
-    // Atomic update for max steps and number
-    int old_steps = atomicMax(d_max_steps, steps);
-    if (steps > old_steps) {
-        *d_max_number = num;
-    }
-}
-
-// Function to launch GPU kernel and handle streams on multiple GPUs
-void process_range_gpu(int gpu_id, long long start, long long end, long long& max_number, int& max_steps, cudaStream_t stream) {
-    // Set the device for this GPU
-    CUDA_CALL(cudaSetDevice(gpu_id));
-
-    long long range_size = end - start;
-    
-    // Determine optimal block and grid size using occupancy calculator
-    int threads_per_block = 0;
-    int min_grid_size = 0;
-    CUDA_CALL(cudaOccupancyMaxPotentialBlockSize(&min_grid_size, &threads_per_block, collatz_kernel, 0, range_size));
-
-    int blocks_per_grid = (range_size + threads_per_block - 1) / threads_per_block;
-
-    // Allocate memory on the device
-    int* d_max_steps;
-    long long* d_max_number;
-    CUDA_CALL(cudaMalloc(&d_max_steps, sizeof(int)));
-    CUDA_CALL(cudaMalloc(&d_max_number, sizeof(long long)));
-
-    // Initialize device memory
-    CUDA_CALL(cudaMemsetAsync(d_max_steps, 0, sizeof(int), stream));
-    CUDA_CALL(cudaMemsetAsync(d_max_number, 0, sizeof(long long), stream));
-
-    // Launch the CUDA kernel asynchronously on the stream
-    collatz_kernel<<<blocks_per_grid, threads_per_block, 0, stream>>>(start, end, d_max_steps, d_max_number);
-    
-    // Synchronize the stream and check for errors
-    CUDA_CALL(cudaStreamSynchronize(stream));
-    CUDA_CALL(cudaGetLastError());
-
-    // Copy results back to host
-    CUDA_CALL(cudaMemcpyAsync(&max_steps, d_max_steps, sizeof(int), cudaMemcpyDeviceToHost, stream));
-    CUDA_CALL(cudaMemcpyAsync(&max_number, d_max_number, sizeof(long long), cudaMemcpyDeviceToHost, stream));
-
-    // Free device memory
-    CUDA_CALL(cudaFree(d_max_steps));
-    CUDA_CALL(cudaFree(d_max_number));
+    atomicMax_uint128(d_max_steps, d_number_with_max_steps, local_max_steps, local_number_with_max_steps);
 }
 
 int main() {
-    // Check the number of available GPUs
-    int num_gpus;
-    CUDA_CALL(cudaGetDeviceCount(&num_gpus));
+    int device_count;
+    cudaGetDeviceCount(&device_count);
 
-    if (num_gpus < 2) {
-        std::cerr << "This program requires at least 2 GPUs." << std::endl;
-        return 1;
+    // Define the ranges for the full 128-bit limit
+    std::vector<std::pair<uint128, uint128>> ranges;
+    uint128 base = {1, 0};  // Start from 2^0 to cover the full 128-bit range
+    for (int i = 0; i < 40; ++i) {
+        uint128 start = base;
+        uint128 end = base;
+        uint128 multiplier = {10, 0};
+        uint128 result = mul_uint128(base.low, multiplier.low);
+        end.low = result.low;
+        end.high = base.high * multiplier.low + result.high;
+        ranges.emplace_back(start, end);
+        base = end;
     }
 
-    std::vector<std::pair<long long, long long>> groups = {
-        {1, 10},
-        {10, 100},
-        {100, 1000},
-        {1000, 10000},
-        {10000, 100000},
-        {100000, 1000000},
-        {1000000, 10000000},
-        {10000000, 100000000},
-        {100000000, 1000000000},
-        {1000000000, 10000000000},
-        {10000000000, 100000000000}
-    };
+    // Start timing
+    auto start_time = std::chrono::high_resolution_clock::now();
 
-    const int num_threads = std::thread::hardware_concurrency();
+    // Loop through each range and find the number with the maximum Collatz steps
+    for (int i = 0; i < ranges.size(); ++i) {
+        const auto &range = ranges[i];
+        uint128 start = range.first;
+        uint128 end = range.second;
 
-    std::vector<std::thread> threads;
-    std::mutex mtx;
+        std::vector<cudaStream_t> streams(device_count);
+        std::vector<unsigned long long *> d_max_steps(device_count);
+        std::vector<uint128 *> d_number_with_max_steps(device_count);
 
-    // Each GPU will use a stream for asynchronous kernel execution
-    cudaStream_t streams[2];
-    for (int i = 0; i < 2; ++i) {
-        CUDA_CALL(cudaSetDevice(i));
-        CUDA_CALL(cudaStreamCreate(&streams[i]));
-    }
+        unsigned long long h_max_steps = 0;
+        uint128 h_number_with_max_steps = {0, 0};
 
-    for (const auto& group : groups) {
-        auto start_time = std::chrono::high_resolution_clock::now();
+        for (int device = 0; device < device_count; ++device) {
+            cudaSetDevice(device);
 
-        long long max_number = 0;
-        int max_steps = 0;
+            cudaMalloc(&d_max_steps[device], sizeof(unsigned long long));
+            cudaMalloc(&d_number_with_max_steps[device], sizeof(uint128));
 
-        // Divide the range between two GPUs
-        long long range_mid = (group.second - group.first) / 2;
-        long long gpu1_start = group.first;
-        long long gpu1_end = group.first + range_mid;
-        long long gpu2_start = group.first + range_mid;
-        long long gpu2_end = group.second;
+            cudaMemset(d_max_steps[device], 0, sizeof(unsigned long long));
+            cudaMemset(d_number_with_max_steps[device], 0, sizeof(uint128));
 
-        // Thread function to run on each GPU
-        auto thread_func = [&](int gpu_id, long long start, long long end, cudaStream_t stream) {
-            long long local_max_number = 0;
-            int local_max_steps = 0;
+            cudaStreamCreate(&streams[device]);
 
-            process_range_gpu(gpu_id, start, end, local_max_number, local_max_steps, stream);
+            int threads_per_block;
+            int blocks_per_grid;
+            cudaOccupancyMaxPotentialBlockSize(&blocks_per_grid, &threads_per_block, find_max_collatz_steps_in_range);
 
-            // Update the global maximum safely
-            std::lock_guard<std::mutex> lock(mtx);
-            if (local_max_steps > max_steps) {
-                max_steps = local_max_steps;
-                max_number = local_max_number;
-            }
-        };
-
-        // Launch a thread for each GPU
-        threads.emplace_back(thread_func, 0, gpu1_start, gpu1_end, streams[0]);
-        threads.emplace_back(thread_func, 1, gpu2_start, gpu2_end, streams[1]);
-
-        // Join both threads
-        for (auto& thread : threads) {
-            thread.join();
+            find_max_collatz_steps_in_range<<<blocks_per_grid, threads_per_block, 0, streams[device]>>>(start, end, d_max_steps[device], d_number_with_max_steps[device]);
         }
-        threads.clear();
 
+        for (int device = 0; device < device_count; ++device) {
+            cudaSetDevice(device);
+            cudaStreamSynchronize(streams[device]);
+
+            unsigned long long temp_max_steps;
+            uint128 temp_number_with_max_steps;
+            cudaMemcpy(&temp_max_steps, d_max_steps[device], sizeof(unsigned long long), cudaMemcpyDeviceToHost);
+            cudaMemcpy(&temp_number_with_max_steps, d_number_with_max_steps[device], sizeof(uint128), cudaMemcpyDeviceToHost);
+
+            if (temp_max_steps > h_max_steps) {
+                h_max_steps = temp_max_steps;
+                h_number_with_max_steps = temp_number_with_max_steps;
+            }
+
+            cudaFree(d_max_steps[device]);
+            cudaFree(d_number_with_max_steps[device]);
+            cudaStreamDestroy(streams[device]);
+        }
+
+        // End timing
         auto end_time = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double> elapsed = end_time - start_time;
+        std::chrono::duration<double> execution_time = end_time - start_time;
 
-        std::cout << "Range " << group.first << " to " << group.second << ":\n";
-        std::cout << "  Number with max steps: " << max_number << " (" << max_steps << " steps)\n";
-        std::cout << "Computation time: " << elapsed.count() << " seconds\n\n";
-    }
-
-    // Destroy CUDA streams
-    for (int i = 0; i < 2; ++i) {
-        CUDA_CALL(cudaSetDevice(i));
-        CUDA_CALL(cudaStreamDestroy(streams[i]));
+        // Display the result vertically with color
+        std::cout << BOLD_BLUE << "Range " << start.low << " - " << end.low << ":\n"
+                  << BOLD_GREEN << "Number with max steps: " << h_number_with_max_steps.low << " (high: " << h_number_with_max_steps.high << ")\n"
+                  << BOLD_YELLOW << "Steps: " << h_max_steps << "\n"
+                  << BOLD_RED << "Time taken: " << execution_time.count() << " seconds\n"
+                  << RESET << "-----------------------------\n";
     }
 
     return 0;
