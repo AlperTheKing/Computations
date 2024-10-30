@@ -4,12 +4,13 @@
 #include <mutex>
 #include <chrono>
 #include <vector>
-#include <cstdint>
+#include <gmpxx.h> // Include GMP C++ header
+
 using namespace std;
 
-const int R_LMT = 1000;
-int64_t global_max = 0;
-int64_t ans = 0;
+const int R_LMT = 20000;
+mpz_class ans = 0;
+int64_t total_triangles = 0; // Variable to count the number of triangles
 mutex mtx;
 int r_current = 2;
 
@@ -24,30 +25,33 @@ void calculate() {
             r_current += 2;
         }
 
-        int64_t local_ans = 0;
-        int64_t local_max = 0;
+        mpz_class local_ans = 0;
+        int64_t local_count = 0; // Local count of triangles
 
-        for (int64_t a = 1; a * a <= 3 * r * r; ++a) {
-            for (int64_t b = max(r * r / a, a); a * b <= 3 * r * r; ++b) {
-                int64_t p = r * r * (a + b);
-                int64_t q = a * b - r * r;
+        mpz_class r_squared = mpz_class(r) * r;
+
+        for (mpz_class a = 1; a * a <= 3 * r_squared; ++a) {
+            mpz_class temp = r_squared / a;
+            mpz_class min_b = (temp > a) ? temp : a;
+            for (mpz_class b = min_b; a * b <= 3 * r_squared; ++b) {
+                mpz_class p = r_squared * (a + b);
+                mpz_class q = a * b - r_squared;
                 if (q <= 0)
                     continue;
                 if (p < b * q)
                     break;
-                if (p % q == 0) {
-                    int64_t c = p / q;
-                    int64_t sum_ab = a + b;
-                    int64_t sum_ac = a + c;
-                    int64_t sum_bc = b + c;
-
-                    // Uncomment the following lines to see the values of a+b, a+c, b+c
-                    // cout << "a+b: " << sum_ab << ", a+c: " << sum_ac << ", b+c: " << sum_bc << endl;
-
-                    local_max = max({local_max, sum_ab, sum_ac, sum_bc});
-
-                    int64_t perimeter = 2 * (a + b + c);
+                if (mpz_divisible_p(p.get_mpz_t(), q.get_mpz_t())) {
+                    mpz_class c = p / q;
+                    mpz_class perimeter = 2 * (a + b + c);
                     local_ans += perimeter;
+                    local_count++; // Increment local triangle count
+
+                    // Uncomment the following lines to see the values of a+b, a+c, and b+c
+                    /*
+                    cout << "r = " << r << ": a+b = " << a + b
+                         << ", a+c = " << a + c
+                         << ", b+c = " << b + c << endl;
+                    */
                 }
             }
         }
@@ -55,7 +59,7 @@ void calculate() {
         {
             lock_guard<mutex> lock(mtx);
             ans += local_ans;
-            global_max = max(global_max, local_max);
+            total_triangles += local_count; // Update global triangle count
         }
     }
 }
@@ -76,11 +80,11 @@ int main() {
     }
 
     auto end_time = chrono::high_resolution_clock::now();
-    
+
     auto duration = chrono::duration_cast<chrono::milliseconds>(end_time - start_time).count();
 
-    cout << "Largest value among all (a+b, a+c, b+c): " << global_max << endl;
-    cout << "Total perimeter sum: " << ans << endl;
+    cout << "Total triangles found: " << total_triangles << endl;
+    cout << "Total perimeter sum: " << ans.get_str() << endl;
     cout << "Execution time: " << duration << " milliseconds" << endl;
 
     return 0;
