@@ -28,7 +28,7 @@ void count_triangles(int64_t max_perimeter, int64_t start, int64_t end) {
                 if (c >= b && a + b > c) { // Check triangle inequality
                     if (gcd(gcd(a, b), c) == 1) { // Check if primitive
                         int64_t count = triangle_count.fetch_add(1); // Atomic increment
-                        if ((count + 1) % 1000000 == 0) { // Print every millionth triangle
+                        if ((count + 1) % 1000000000 == 0) {
                             std::lock_guard<std::mutex> guard(print_mutex); // Lock for safe printing
                             std::cout << "Found triangle #" << (count + 1) << ": (" << a << ", " << b << ", " << c << ")\n";
                         }
