@@ -1,195 +1,233 @@
 #include <iostream>
-#include <cuda_runtime.h>
-#include <cmath>
+#include <cuda.h>
+#include <vector>
 #include <chrono>
-#include <atomic>
-#include <stdio.h>      // Required for fprintf and stderr
-#include <vector>       // Required for std::vector
-#include <tuple>        // Required for std::tuple
+#include <algorithm>
+#include <mutex>
 
-#define MAX_PERIMETER 10000000
-#define TRIANGLE_STORAGE_INTERVAL 1000000
-#define MAX_TRIANGLES_TO_STORE 10 // Adjust based on expected count
+// Define maximum perimeter
+const unsigned long long int MAX_PERIMETER = 10000000;
 
-// Macro to check CUDA errors
-#define cudaCheckError(ans) { gpuAssert((ans), __FILE__, __LINE__); }
+// Define threshold for printing triangles (e.g., every 1,000,000th triangle)
+const unsigned long long int PRINT_THRESHOLD = 1000000000; // Adjust to 1000000000 as needed
 
-// Function to handle CUDA errors
-inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true) {
-    if (code != cudaSuccess) {
-        fprintf(stderr, "CUDA Error: %s at %s:%d\n", cudaGetErrorString(code), file, line);
-        if (abort) exit(code);
-    }
-}
+// Mutex for synchronized output (host-side)
+std::mutex print_mutex;
 
-// Device-side variables (separate for each GPU)
-__device__ unsigned long long triangle_count;
-
-// Arrays to store every millionth triangle
-__device__ unsigned long long triangle_data_a[MAX_TRIANGLES_TO_STORE];
-__device__ unsigned long long triangle_data_b[MAX_TRIANGLES_TO_STORE];
-__device__ unsigned long long triangle_data_c[MAX_TRIANGLES_TO_STORE];
-
-// Device GCD function
-__device__ int64_t gcd(int64_t a, int64_t b) {
+// Device function to compute GCD of two numbers
+__device__ unsigned long long int device_gcd(unsigned long long int a, unsigned long long int b) {
     while (b != 0) {
-        int64_t temp = a % b;
-        a = b;
-        b = temp;
+        unsigned long long int temp = b;
+        b = a % b;
+        a = temp;
     }
     return a;
 }
 
-// Kernel to count primitive triangles
-__global__ void count_triangles(int64_t start, int64_t end) {
-    int64_t p = blockIdx.x * blockDim.x + threadIdx.x + start;
+// Device function to compute GCD of three numbers
+__device__ unsigned long long int device_gcd_three(unsigned long long int a, unsigned long long int b, unsigned long long int c) {
+    return device_gcd(a, device_gcd(b, c));
+}
 
-    if (p < end) {
-        for (int64_t a = 1; a <= p / 3; ++a) {
-            for (int64_t b = a; b <= (p - a) / 2; ++b) {
-                int64_t c = p - a - b;
-                if (c >= b && a + b > c) { // Triangle inequality
-                    if (gcd(gcd(a, b), c) == 1) { // Primitive triangle
-                        unsigned long long count = atomicAdd(&triangle_count, 1);
-                        if ((count + 1) % TRIANGLE_STORAGE_INTERVAL == 0 && 
-                            (count + 1) / TRIANGLE_STORAGE_INTERVAL <= MAX_TRIANGLES_TO_STORE) {
-                            int index = (count + 1) / TRIANGLE_STORAGE_INTERVAL - 1;
-                            triangle_data_a[index] = a;
-                            triangle_data_b[index] = b;
-                            triangle_data_c[index] = c;
-                        }
-                    }
+// Kernel to count primitive triangles
+__global__ void count_triangles_kernel(unsigned long long int start_p, unsigned long long int end_p, unsigned long long int* d_count, unsigned long long int* d_next_threshold) {
+    unsigned long long int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long int p = start_p + idx;
+
+    if (p >= end_p) return;
+
+    unsigned long long int local_count = 0;
+
+    for (unsigned long long int a = 1; a <= p / 3; ++a) {
+        for (unsigned long long int b = a; b <= (p - a) / 2; ++b) {
+            unsigned long long int c = p - a - b;
+            if (a + b > c) { // Triangle inequality
+                if (device_gcd_three(a, b, c) == 1) { // Primitive check
+                    local_count++;
                 }
             }
         }
     }
+
+    // Atomic addition to global count
+    unsigned long long int new_count = atomicAdd(d_count, local_count) + local_count;
+
+    // Check if new_count >= next_threshold
+    unsigned long long int threshold = *d_next_threshold;
+    if (new_count >= threshold) {
+        // Attempt to increment next_threshold atomically
+        if (atomicCAS(d_next_threshold, threshold, threshold + PRINT_THRESHOLD) == threshold) {
+            // This thread successfully updated the threshold
+            // Note: Printing specific (a, b, c) is non-trivial without additional tracking
+            printf("Reached %llu primitive triangles.\n", new_count);
+        }
+    }
+}
+
+// Function to determine optimal block and grid sizes using occupancy API
+void determine_block_grid_sizes(int device_id, unsigned long long int per_device_perimeters, int& optimal_block_size, int& optimal_grid_size) {
+    cudaDeviceProp deviceProp;
+    cudaGetDeviceProperties(&deviceProp, device_id);
+
+    int minGridSize;
+    int blockSize_temp;
+
+    // Determine the block size and grid size to maximize occupancy
+    cudaOccupancyMaxPotentialBlockSize(&minGridSize, &blockSize_temp, count_triangles_kernel, 0, 0);
+    optimal_block_size = blockSize_temp;
+    optimal_grid_size = (per_device_perimeters + optimal_block_size - 1) / optimal_block_size;
+}
+
+// Function to check for CUDA errors
+void checkCudaError(cudaError_t err, const char* msg) {
+    if (err != cudaSuccess) {
+        std::cerr << "CUDA Error: " << msg << " - " << cudaGetErrorString(err) << std::endl;
+        exit(EXIT_FAILURE);
+    }
 }
 
 int main() {
-    // Get CUDA device count
-    int deviceCount;
-    cudaCheckError(cudaGetDeviceCount(&deviceCount));
-    if (deviceCount < 1) {
-        std::cerr << "No CUDA devices found.\n";
-        return -1;
-    }
-    std::cout << "Number of CUDA devices: " << deviceCount << std::endl;
+    // Step 1: Get number of CUDA-capable devices
+    int device_count = 0;
+    cudaError_t err = cudaGetDeviceCount(&device_count);
+    checkCudaError(err, "Getting device count");
 
-    // Display device names
-    for (int i = 0; i < deviceCount; ++i) {
-        cudaDeviceProp deviceProp;
-        cudaCheckError(cudaGetDeviceProperties(&deviceProp, i));
-        std::cout << "Device " << i << ": " << deviceProp.name << std::endl;
+    if (device_count < 2) {
+        std::cerr << "Error: This program requires at least two CUDA-capable GPUs." << std::endl;
+        return EXIT_FAILURE;
     }
 
-    // Start timing
-    auto start_time = std::chrono::high_resolution_clock::now();
-
-    // Structure to hold per-device data
-    struct DeviceData {
-        int deviceId;
-        cudaStream_t stream;
-        unsigned long long h_triangle_count;
-        unsigned long long h_triangle_data_a[MAX_TRIANGLES_TO_STORE];
-        unsigned long long h_triangle_data_b[MAX_TRIANGLES_TO_STORE];
-        unsigned long long h_triangle_data_c[MAX_TRIANGLES_TO_STORE];
-        dim3 gridSize;
-        dim3 blockSize;
-    };
-
-    std::vector<DeviceData> devices(deviceCount);
-
-    // Determine per-device workload and initialize each device
-    for (int i = 0; i < deviceCount; ++i) {
-        devices[i].deviceId = i;
-        cudaCheckError(cudaSetDevice(i));
-
-        // Initialize triangle_count to zero on device
-        unsigned long long zero = 0;
-        cudaCheckError(cudaMemcpyToSymbol(triangle_count, &zero, sizeof(unsigned long long), 0, cudaMemcpyHostToDevice));
-
-        // Determine optimal block and grid sizes for this device
-        int minGridSize;
-        int blockSizeMax;
-        cudaCheckError(cudaOccupancyMaxPotentialBlockSize(&minGridSize, &blockSizeMax, count_triangles, 0, 0));
-        devices[i].blockSize = dim3(blockSizeMax);
-        
-        // Calculate grid size based on per-device workload
-        int64_t perDevice = MAX_PERIMETER / deviceCount;
-        int64_t start_p = perDevice * i + 1;
-        int64_t end_p = (i == deviceCount - 1) ? MAX_PERIMETER + 1 : perDevice * (i + 1) + 1;
-        int64_t totalWork = end_p - start_p;
-        devices[i].gridSize = dim3((totalWork + devices[i].blockSize.x - 1) / devices[i].blockSize.x);
-
-        // Create a CUDA stream for this device
-        cudaCheckError(cudaStreamCreate(&devices[i].stream));
+    // Step 2: Divide perimeters among devices
+    std::vector<unsigned long long int> per_device_perimeters(device_count, 0);
+    unsigned long long int per_device = MAX_PERIMETER / device_count;
+    for (int i = 0; i < device_count; ++i) {
+        per_device_perimeters[i] = per_device;
     }
+    // Assign remaining perimeters to the last device
+    per_device_perimeters[device_count - 1] += MAX_PERIMETER % device_count;
+
+    // Step 3: Create streams and allocate memory
+    std::vector<cudaStream_t> streams(device_count);
+    std::vector<unsigned long long int*> d_counts(device_count, nullptr);
+    std::vector<unsigned long long int*> d_next_thresholds(device_count, nullptr);
+    std::vector<unsigned long long int> h_counts(device_count, 0);
+    std::vector<unsigned long long int> h_next_thresholds(device_count, PRINT_THRESHOLD);
+
+    for (int i = 0; i < device_count; ++i) {
+        // Set device
+        cudaSetDevice(i);
+
+        // Create stream
+        err = cudaStreamCreate(&streams[i]);
+        checkCudaError(err, "Creating stream");
+
+        // Allocate device memory for count
+        err = cudaMalloc((void**)&d_counts[i], sizeof(unsigned long long int));
+        checkCudaError(err, "Allocating device memory for count");
+
+        // Allocate device memory for next_threshold
+        err = cudaMalloc((void**)&d_next_thresholds[i], sizeof(unsigned long long int));
+        checkCudaError(err, "Allocating device memory for next_threshold");
+
+        // Initialize count to zero
+        err = cudaMemsetAsync(d_counts[i], 0, sizeof(unsigned long long int), streams[i]);
+        checkCudaError(err, "Initializing device count to zero");
+
+        // Initialize next_threshold to PRINT_THRESHOLD
+        err = cudaMemcpyAsync(d_next_thresholds[i], &h_next_thresholds[i], sizeof(unsigned long long int), cudaMemcpyHostToDevice, streams[i]);
+        checkCudaError(err, "Initializing device next_threshold");
+    }
+
+    // Step 4: Determine block and grid sizes and launch kernels
+    std::vector<int> blockSizes(device_count, 256);
+    std::vector<int> gridSizes(device_count, 0);
+
+    for (int i = 0; i < device_count; ++i) {
+        determine_block_grid_sizes(i, per_device_perimeters[i], blockSizes[i], gridSizes[i]);
+    }
+
+    // Create CUDA events for timing
+    cudaEvent_t start_event, stop_event;
+    cudaEventCreate(&start_event);
+    cudaEventCreate(&stop_event);
+
+    // Record start event
+    cudaEventRecord(start_event, 0);
 
     // Launch kernels on each device
-    for (int i = 0; i < deviceCount; ++i) {
-        cudaCheckError(cudaSetDevice(devices[i].deviceId));
+    for (int i = 0; i < device_count; ++i) {
+        cudaSetDevice(i);
 
-        int64_t perDevice = MAX_PERIMETER / deviceCount;
-        int64_t start_p = perDevice * i + 1;
-        int64_t end_p = (i == deviceCount - 1) ? MAX_PERIMETER + 1 : perDevice * (i + 1) + 1;
+        // Calculate start and end perimeters
+        unsigned long long int start_p = (i * (MAX_PERIMETER / device_count)) + 1;
+        unsigned long long int end_p = start_p + per_device_perimeters[i];
 
-        // Launch the kernel on this device's stream
-        count_triangles<<<devices[i].gridSize, devices[i].blockSize, 0, devices[i].stream>>>(start_p, end_p);
-        cudaCheckError(cudaGetLastError());
+        // Launch kernel
+        count_triangles_kernel<<<gridSizes[i], blockSizes[i], 0, streams[i]>>>(
+            start_p,
+            end_p,
+            d_counts[i],
+            d_next_thresholds[i]
+        );
+
+        // Check for kernel launch errors
+        err = cudaGetLastError();
+        checkCudaError(err, "Launching kernel");
     }
 
-    // Synchronize all devices
-    for (int i = 0; i < deviceCount; ++i) {
-        cudaCheckError(cudaSetDevice(devices[i].deviceId));
-        cudaCheckError(cudaStreamSynchronize(devices[i].stream));
+    // Step 5: Record stop event after all kernels are launched
+    cudaEventRecord(stop_event, 0);
+
+    // Wait for all streams to complete
+    for (int i = 0; i < device_count; ++i) {
+        cudaSetDevice(i);
+        cudaStreamSynchronize(streams[i]);
     }
 
-    // Collect results from all devices
-    unsigned long long total_triangle_count = 0;
-    std::vector<std::tuple<unsigned long long, unsigned long long, unsigned long long>> all_triangles;
+    // Record stop event
+    cudaEventRecord(stop_event, 0);
+    cudaEventSynchronize(stop_event);
 
-    for (int i = 0; i < deviceCount; ++i) {
-        cudaCheckError(cudaSetDevice(devices[i].deviceId));
+    // Step 6: Calculate elapsed time
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start_event, stop_event);
 
-        // Copy triangle_count from device to host
-        cudaCheckError(cudaMemcpyFromSymbol(&devices[i].h_triangle_count, triangle_count, sizeof(unsigned long long), 0, cudaMemcpyDeviceToHost));
-        total_triangle_count += devices[i].h_triangle_count;
+    // Step 7: Copy counts back to host
+    for (int i = 0; i < device_count; ++i) {
+        cudaSetDevice(i);
+        err = cudaMemcpyAsync(&h_counts[i], d_counts[i], sizeof(unsigned long long int), cudaMemcpyDeviceToHost, streams[i]);
+        checkCudaError(err, "Copying count from device to host");
 
-        // Copy triangle_data from device to host
-        cudaCheckError(cudaMemcpy(devices[i].h_triangle_data_a, triangle_data_a, sizeof(devices[i].h_triangle_data_a), cudaMemcpyDeviceToHost));
-        cudaCheckError(cudaMemcpy(devices[i].h_triangle_data_b, triangle_data_b, sizeof(devices[i].h_triangle_data_b), cudaMemcpyDeviceToHost));
-        cudaCheckError(cudaMemcpy(devices[i].h_triangle_data_c, triangle_data_c, sizeof(devices[i].h_triangle_data_c), cudaMemcpyDeviceToHost));
-
-        // Aggregate stored triangles
-        unsigned long long num_million = devices[i].h_triangle_count / TRIANGLE_STORAGE_INTERVAL;
-        for (unsigned long long j = 0; j < num_million && j < MAX_TRIANGLES_TO_STORE; ++j) {
-            all_triangles.emplace_back(
-                devices[i].h_triangle_data_a[j],
-                devices[i].h_triangle_data_b[j],
-                devices[i].h_triangle_data_c[j]
-            );
-        }
+        err = cudaMemcpyAsync(&h_next_thresholds[i], d_next_thresholds[i], sizeof(unsigned long long int), cudaMemcpyDeviceToHost, streams[i]);
+        checkCudaError(err, "Copying next_threshold from device to host");
     }
 
-    // Output every millionth triangle
-    for (size_t i = 0; i < all_triangles.size(); ++i) {
-        auto [a, b, c] = all_triangles[i];
-        std::cout << "Found triangle #" << (i + 1) * TRIANGLE_STORAGE_INTERVAL << ": ("
-                  << a << ", " << b << ", " << c << ")\n";
+    // Wait for all copies to finish
+    for (int i = 0; i < device_count; ++i) {
+        cudaSetDevice(i);
+        cudaStreamSynchronize(streams[i]);
     }
 
-    // End timing
-    auto end_time = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> duration = end_time - start_time;
-
-    std::cout << "Total primitive triangles found: " << total_triangle_count << "\n";
-    std::cout << "Execution time: " << duration.count() << " seconds.\n";
-
-    // Clean up streams
-    for (int i = 0; i < deviceCount; ++i) {
-        cudaCheckError(cudaSetDevice(devices[i].deviceId));
-        cudaCheckError(cudaStreamDestroy(devices[i].stream));
+    // Step 8: Aggregate counts
+    unsigned long long int total_count = 0;
+    for (int i = 0; i < device_count; ++i) {
+        total_count += h_counts[i];
     }
+
+    // Step 9: Clean up
+    for (int i = 0; i < device_count; ++i) {
+        cudaSetDevice(i);
+        cudaFree(d_counts[i]);
+        cudaFree(d_next_thresholds[i]);
+        cudaStreamDestroy(streams[i]);
+    }
+
+    cudaEventDestroy(start_event);
+    cudaEventDestroy(stop_event);
+
+    // Step 10: Output the results
+    std::cout << "Total primitive triangles found: " << total_count << "\n";
+    std::cout << "Execution time: " << milliseconds / 1000.0 << " seconds.\n";
 
     return 0;
 }
