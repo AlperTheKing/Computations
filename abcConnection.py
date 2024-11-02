@@ -1,5 +1,3 @@
-# File: abc_connection_grid_output.py
-
 from ortools.sat.python import cp_model
 
 def main():
