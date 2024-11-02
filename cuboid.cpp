@@ -11,7 +11,7 @@
 // Maximum side length (set to 1,000,000 as per requirement)
 // WARNING: This value leads to an extremely large number of iterations.
 // It is highly recommended to use a smaller value for practical execution.
-const int64_t MAX_SIDE = 1000000;
+const int64_t MAX_SIDE = 10000000;
 
 // Structure to store brick dimensions
 struct Brick {
