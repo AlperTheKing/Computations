@@ -4,23 +4,17 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <string>
+#include <fstream>
 #include <cuda_runtime.h>
-#include <unordered_map>
-#include <mutex>
 
 // Constants
-constexpr uint64_t MAX_A_B_C_D = 50000;
-constexpr uint64_t MAX_E = 65535; // Adjusted to fit within uint64_t
-constexpr __int128 MAX_E4 = (__int128)MAX_E * MAX_E * MAX_E * MAX_E;
+constexpr uint64_t MAX_A_B_C_D = 90000;
+constexpr uint64_t MAX_E = 120000; // Adjusted to ensure e^4 <= UINT64_MAX
+constexpr uint64_t MIN_CHUNK_SIZE = 10;
+constexpr uint64_t MAX_SOLUTIONS_PER_GPU = 2000000; // Adjust as needed
 
-// Structure to hold a partial solution (c, d, e)
-struct PartialSolution {
-    uint64_t c;
-    uint64_t d;
-    uint64_t e;
-};
-
-// Structure to hold a complete solution (a, b, c, d, e)
+// Structure to hold a solution
 struct Solution {
     uint64_t a;
     uint64_t b;
@@ -29,391 +23,446 @@ struct Solution {
     uint64_t e;
 };
 
-// Error checking macro
-#define CUDA_CHECK_ERROR(call)                                                 \
-    {                                                                          \
-        cudaError_t err = call;                                                \
-        if (err != cudaSuccess) {                                              \
-            std::cerr << "CUDA Error: " << cudaGetErrorString(err)             \
-                      << " at " << __FILE__ << ":" << __LINE__ << std::endl;   \
-            exit(EXIT_FAILURE);                                                \
-        }                                                                      \
-    }
+// Structure to hold a^4 + b^4 sums
+struct ABSum {
+    uint64_t sum; // sum <= 1.3122e19 < UINT64_MAX
+    uint64_t a;
+    uint64_t b;
+};
 
-// Device function for binary search
-__device__ bool binary_search_device(const uint64_t* array, size_t size, uint64_t target) {
-    size_t left = 0;
-    size_t right = size;
-    while (left < right) {
-        size_t mid = left + (right - left) / 2;
-        if (array[mid] == target) {
-            return true;
-        } else if (array[mid] < target) {
-            left = mid + 1;
-        } else {
-            right = mid;
-        }
-    }
-    return false;
-}
-
-// CUDA Kernel to find partial solutions
-__global__ void findSolutionsKernel(
-    const uint64_t* a4b4_sums, size_t a4b4_size,
-    const uint64_t* i_pows,
-    uint64_t e_start, uint64_t e_end,
-    PartialSolution* partial_solutions,
-    unsigned long long int* partial_count)
-{
+// CUDA Kernel to process assigned e's
+__global__ void processEsKernel(
+    const uint64_t* __restrict__ e_values, uint64_t num_es,
+    const uint64_t* __restrict__ ab_sums, const uint64_t* __restrict__ ab_a, const uint64_t* __restrict__ ab_b, uint64_t ab_size,
+    Solution* __restrict__ solutions,
+    unsigned long long int* __restrict__ solution_count,
+    uint64_t max_solutions // Boundary check
+) {
     uint64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    uint64_t e = e_start + idx;
-    if (e > e_end || e > 65535) return;
+    uint64_t stride = blockDim.x * gridDim.x;
 
-    uint64_t e4 = i_pows[e];
+    for (uint64_t i = idx; i < num_es; i += stride) {
+        uint64_t e = e_values[i];
+        uint64_t e4 = e * e * e * e;
 
-    // Iterate over c
-    for (uint64_t c = 1; c <= MAX_A_B_C_D; ++c) {
-        uint64_t c4 = i_pows[c];
-        if (c4 >= e4) break; // c^4 >= e^4
+        for (uint64_t c = 1; c <= MAX_A_B_C_D; c++) {
+            uint64_t c4 = c * c * c * c;
+            if (c4 >= e4) break;
 
-        // Iterate over d starting from c to ensure c <= d
-        for (uint64_t d = c; d <= MAX_A_B_C_D; ++d) {
-            uint64_t d4 = i_pows[d];
-            uint64_t cd4 = c4 + d4;
-            if (cd4 >= e4) break; // c^4 + d^4 >= e^4
+            for (uint64_t d = c; d <= MAX_A_B_C_D; d++) { // Ensure c <= d
+                uint64_t d4 = d * d * d * d;
+                uint64_t cd4 = c4 + d4;
+                if (cd4 >= e4) break; // Ensure c^4 + d^4 < e^4
 
-            uint64_t remaining = e4 - cd4;
+                uint64_t remaining = e4 - cd4;
 
-            // Perform binary search for remaining in a4b4_sums
-            bool found = binary_search_device(a4b4_sums, a4b4_size, remaining);
-            if (found) {
-                // Atomic increment to get unique index
-                unsigned long long int sol_idx = atomicAdd(partial_count, 1);
-                if (sol_idx < 10000000) { // Ensure we don't exceed allocated memory
-                    partial_solutions[sol_idx].c = c;
-                    partial_solutions[sol_idx].d = d;
-                    partial_solutions[sol_idx].e = e;
+                // Binary search for remaining in ab_sums
+                uint64_t left = 0;
+                uint64_t right = ab_size;
+                uint64_t mid = 0;
+                bool found = false;
+                uint64_t found_idx = 0;
+
+                while (left < right) {
+                    mid = left + (right - left) / 2;
+                    uint64_t mid_val = ab_sums[mid];
+                    if (mid_val < remaining) {
+                        left = mid + 1;
+                    }
+                    else {
+                        right = mid;
+                    }
+                }
+
+                if (left < ab_size && ab_sums[left] == remaining) {
+                    found = true;
+                    found_idx = left;
+                }
+
+                if (found) {
+                    uint64_t a = ab_a[found_idx];
+                    uint64_t b = ab_b[found_idx];
+
+                    // Ensure a <= b <= c to satisfy a <= b <= c <= d
+                    if (b <= c) {
+                        Solution sol;
+                        sol.a = a;
+                        sol.b = b;
+                        sol.c = c;
+                        sol.d = d;
+                        sol.e = e;
+
+                        // Atomic add with boundary check
+                        unsigned long long int pos = atomicAdd(solution_count, 1ULL);
+                        if (pos < max_solutions) {
+                            solutions[pos] = sol;
+                        }
+                    }
                 }
             }
         }
     }
 }
 
-// Host function to precompute i^4
-std::vector<uint64_t> precompute_powers(uint64_t max_val) {
-    std::vector<uint64_t> i_pows(max_val + 1, 0);
-    for (uint64_t i = 1; i <= max_val; ++i) {
-        i_pows[i] = i * i * i * i; // i^4
+// Function to initialize work queue with dynamically calculated chunk size
+void initializeWorkQueue(uint64_t max_e, int num_threads, std::vector<std::pair<uint64_t, uint64_t>>& workChunks) {
+    uint64_t chunk_size = std::max(max_e / static_cast<uint64_t>(num_threads * 10), static_cast<uint64_t>(MIN_CHUNK_SIZE));
+    uint64_t current_e = 1;
+    while (current_e <= max_e) {
+        uint64_t end_e = std::min(current_e + chunk_size - 1, max_e);
+        workChunks.emplace_back(std::make_pair(current_e, end_e));
+        current_e += chunk_size;
     }
-    return i_pows;
+    std::cout << "Total work chunks: " << workChunks.size() << " with chunk size: " << chunk_size << std::endl;
 }
 
-// Multithreaded Host function to precompute a^4 + b^4 sums and build a sum-to-(a,b) map
-std::vector<uint64_t> precompute_a4b4_sums_multithreaded(
-    const std::vector<uint64_t>& i_pows,
-    uint64_t max_a_b_c_d,
-    uint64_t max_e4,
-    std::unordered_map<uint64_t, std::vector<std::pair<uint64_t, uint64_t>>>& sum_to_ab_map)
-{
-    // Determine the number of hardware threads available
-    unsigned int num_threads = std::thread::hardware_concurrency();
-    if (num_threads == 0) num_threads = 4; // Fallback to 4 threads if unable to detect
-    std::cout << "Precomputing a^4 + b^4 sums using " << num_threads << " threads...\n";
+// Function to precompute a^4 + b^4 sums
+void precomputeABSums(const std::vector<uint64_t>& i_pows, std::vector<ABSum>& ab_pows_vec) {
+    std::cout << "Starting precomputation of a^4 + b^4 sums..." << std::endl;
 
-    // Calculate the range of 'a' for each thread
-    uint64_t a_per_thread = max_a_b_c_d / num_threads;
-    uint64_t remaining_a = max_a_b_c_d % num_threads;
+    // Reserve memory to prevent frequent reallocations
+    ab_pows_vec.reserve(static_cast<size_t>(MAX_A_B_C_D) * (MAX_A_B_C_D + 1) / 2);
 
-    // Vectors to hold per-thread results
-    std::vector<std::vector<uint64_t>> thread_sums(num_threads);
-    std::vector<std::unordered_map<uint64_t, std::vector<std::pair<uint64_t, uint64_t>>>> thread_maps(num_threads);
-
-    // Lambda function for each thread's work
-    auto worker = [&](unsigned int thread_id, uint64_t a_start, uint64_t a_end) {
-        std::vector<uint64_t>& local_sums = thread_sums[thread_id];
-        std::unordered_map<uint64_t, std::vector<std::pair<uint64_t, uint64_t>>>& local_map = thread_maps[thread_id];
-        local_sums.reserve((a_end - a_start + 1) * (max_a_b_c_d - a_start + 1) / 2); // Approximate reserve
-
-        for (uint64_t a = a_start; a <= a_end; ++a) {
-            uint64_t a4 = i_pows[a];
-            for (uint64_t b = a; b <= max_a_b_c_d; ++b) { // Ensure a <= b
-                uint64_t sum = a4 + i_pows[b];
-                if (sum > max_e4) break; // Do not store sums greater than e^4
-                local_sums.push_back(sum);
-                // Build the sum-to-(a,b) map for memoization
-                local_map[sum].emplace_back(a, b);
-            }
+    for (uint64_t a = 1; a <= MAX_A_B_C_D; a++) {
+        uint64_t a4 = i_pows[a];
+        for (uint64_t b = a; b <= MAX_A_B_C_D; b++) { // Ensure a <= b
+            uint64_t sum = a4 + i_pows[b];
+            if (sum > i_pows[MAX_E]) break; // Do not store sums greater than e^4
+            ab_pows_vec.emplace_back(ABSum{ sum, a, b });
         }
-    };
-
-    // Launch threads
-    std::vector<std::thread> threads;
-    uint64_t current_a = 1;
-    for (unsigned int t = 0; t < num_threads; ++t) {
-        uint64_t a_start = current_a;
-        uint64_t a_end = a_start + a_per_thread - 1;
-        if (t == num_threads - 1) {
-            a_end += remaining_a; // Add any remaining 'a' to the last thread
-        }
-        threads.emplace_back(worker, t, a_start, a_end);
-        current_a = a_end + 1;
-    }
-
-    // Join threads
-    for (auto& th : threads) {
-        th.join();
-    }
-
-    // Merge results from all threads
-    std::vector<uint64_t> a4b4_sums;
-    a4b4_sums.reserve(max_a_b_c_d * max_a_b_c_d / 2); // Adjust as needed
-
-    for (unsigned int t = 0; t < num_threads; ++t) {
-        // Merge sums
-        a4b4_sums.insert(a4b4_sums.end(), thread_sums[t].begin(), thread_sums[t].end());
-
-        // Merge maps
-        for (const auto& pair : thread_maps[t]) {
-            sum_to_ab_map[pair.first].insert(
-                sum_to_ab_map[pair.first].end(),
-                pair.second.begin(),
-                pair.second.end()
-            );
+        if (a % 10000 == 0) {
+            std::cout << "Precomputed a^4 + b^4 for a = " << a << std::endl;
         }
     }
 
-    // Sort the sums for binary search
-    std::sort(a4b4_sums.begin(), a4b4_sums.end());
-
-    return a4b4_sums;
-}
-
-// Function to launch kernels on a specific GPU with automatic block and grid size determination
-void process_on_gpu(
-    int device_id,
-    const std::vector<uint64_t>& a4b4_sums,
-    const std::vector<uint64_t>& i_pows,
-    uint64_t e_start,
-    uint64_t e_end,
-    std::vector<PartialSolution>& host_partial_solutions,
-    float& gpu_time)
-{
-    CUDA_CHECK_ERROR(cudaSetDevice(device_id));
-
-    // Create CUDA stream
-    cudaStream_t stream;
-    CUDA_CHECK_ERROR(cudaStreamCreate(&stream));
-
-    // Allocate and copy a4b4_sums to device
-    uint64_t* d_a4b4_sums;
-    size_t a4b4_bytes = a4b4_sums.size() * sizeof(uint64_t);
-    CUDA_CHECK_ERROR(cudaMalloc((void**)&d_a4b4_sums, a4b4_bytes));
-    CUDA_CHECK_ERROR(cudaMemcpyAsync(d_a4b4_sums, a4b4_sums.data(), a4b4_bytes, cudaMemcpyHostToDevice, stream));
-
-    // Allocate and copy i_pows to device
-    uint64_t* d_i_pows;
-    size_t i_pows_bytes = i_pows.size() * sizeof(uint64_t);
-    CUDA_CHECK_ERROR(cudaMalloc((void**)&d_i_pows, i_pows_bytes));
-    CUDA_CHECK_ERROR(cudaMemcpyAsync(d_i_pows, i_pows.data(), i_pows_bytes, cudaMemcpyHostToDevice, stream));
-
-    // Estimate maximum number of partial solutions
-    size_t max_partial_solutions = 10000000; // Adjust as needed
-    PartialSolution* d_partial_solutions;
-    CUDA_CHECK_ERROR(cudaMalloc((void**)&d_partial_solutions, max_partial_solutions * sizeof(PartialSolution)));
-    unsigned long long int* d_partial_count;
-    CUDA_CHECK_ERROR(cudaMalloc((void**)&d_partial_count, sizeof(unsigned long long int)));
-    CUDA_CHECK_ERROR(cudaMemsetAsync(d_partial_count, 0, sizeof(unsigned long long int), stream));
-
-    // Determine optimal block and grid sizes using cudaOccupancyMaxPotentialBlockSize
-    int block_size;
-    int grid_size;
-    CUDA_CHECK_ERROR(cudaOccupancyMaxPotentialBlockSize(
-        &grid_size,
-        &block_size,
-        findSolutionsKernel,
-        0, // Dynamic shared memory size
-        0  // Block size limit
-    ));
-
-    // Calculate the number of blocks needed based on the e range
-    uint64_t total_e = e_end - e_start + 1;
-    int threadsPerBlock = block_size;
-    int blocksPerGrid = (total_e + threadsPerBlock - 1) / threadsPerBlock;
-
-    // Start timing
-    auto start = std::chrono::high_resolution_clock::now();
-
-    // Launch kernel
-    findSolutionsKernel<<<blocksPerGrid, threadsPerBlock, 0, stream>>>(
-        d_a4b4_sums, a4b4_sums.size(),
-        d_i_pows,
-        e_start, e_end,
-        d_partial_solutions,
-        d_partial_count
-    );
-
-    // Check for kernel launch errors
-    CUDA_CHECK_ERROR(cudaGetLastError());
-
-    // Wait for kernel to finish
-    CUDA_CHECK_ERROR(cudaStreamSynchronize(stream));
-
-    // Stop timing
-    auto stop = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<float> duration = stop - start;
-    gpu_time += duration.count();
-
-    // Retrieve partial solution count
-    unsigned long long int h_partial_count = 0;
-    CUDA_CHECK_ERROR(cudaMemcpyAsync(&h_partial_count, d_partial_count, sizeof(unsigned long long int), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK_ERROR(cudaStreamSynchronize(stream));
-
-    // Retrieve partial solutions
-    std::vector<PartialSolution> h_partial_solutions(h_partial_count);
-    CUDA_CHECK_ERROR(cudaMemcpyAsync(h_partial_solutions.data(), d_partial_solutions, h_partial_count * sizeof(PartialSolution), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK_ERROR(cudaStreamSynchronize(stream));
-
-    // Append to host partial solutions
-    host_partial_solutions.insert(host_partial_solutions.end(), h_partial_solutions.begin(), h_partial_solutions.end());
-
-    // Cleanup
-    CUDA_CHECK_ERROR(cudaFree(d_a4b4_sums));
-    CUDA_CHECK_ERROR(cudaFree(d_i_pows));
-    CUDA_CHECK_ERROR(cudaFree(d_partial_solutions));
-    CUDA_CHECK_ERROR(cudaFree(d_partial_count));
-    CUDA_CHECK_ERROR(cudaStreamDestroy(stream));
+    std::cout << "Precomputed all possible a^4 + b^4 sums." << std::endl;
 }
 
 int main() {
     // Start total computation time
     auto total_start = std::chrono::high_resolution_clock::now();
 
-    // Precompute i^4 on host
-    std::cout << "Precomputing i^4...\n";
-    std::vector<uint64_t> i_pows = precompute_powers(MAX_E);
-    std::cout << "Precomputed i^4 up to " << MAX_E << ".\n";
-
-    // Precompute a^4 + b^4 sums on host and build sum-to-(a,b) map for memoization using multithreading
-    std::cout << "Precomputing a^4 + b^4 sums and building sum-to-(a,b) map using multithreading...\n";
-    std::unordered_map<uint64_t, std::vector<std::pair<uint64_t, uint64_t>>> sum_to_ab_map;
-    std::vector<uint64_t> a4b4_sums = precompute_a4b4_sums_multithreaded(i_pows, MAX_A_B_C_D, MAX_E4, sum_to_ab_map);
-    std::cout << "Precomputed and sorted a^4 + b^4 sums. Total sums: " << a4b4_sums.size() << "\n";
-
-    // Determine the number of CUDA-capable devices
-    int device_count = 0;
-    CUDA_CHECK_ERROR(cudaGetDeviceCount(&device_count));
-    if (device_count < 1) {
-        std::cerr << "This program requires at least one CUDA-capable GPU.\n";
-        return EXIT_FAILURE;
+    // Precompute i^4 using uint64_t
+    std::vector<uint64_t> i_pows(MAX_E + 1, 0);
+    for (uint64_t i = 1; i <= MAX_E; i++) {
+        uint64_t i4 = i * i * i * i;
+        // Overflow check
+        if (i4 < i_pows[i]) {
+            std::cerr << "Overflow detected for i = " << i << std::endl;
+            return -1;
+        }
+        i_pows[i] = i4;
     }
-    std::cout << "Number of CUDA-capable devices detected: " << device_count << "\n";
+    std::cout << "Precomputed all i^4 values up to e = " << MAX_E << "." << std::endl;
 
-    // Define e ranges dynamically based on device count
-    uint64_t e_total = MAX_E;
-    uint64_t e_per_gpu = e_total / device_count;
+    // Precompute all possible a^4 + b^4 and store in a sorted vector
+    std::vector<ABSum> ab_pows_vec;
+    precomputeABSums(i_pows, ab_pows_vec);
 
-    // Prepare e ranges for each GPU
-    std::vector<std::pair<uint64_t, uint64_t>> gpu_e_ranges;
-    for (int i = 0; i < device_count; ++i) {
-        uint64_t e_start = i * e_per_gpu + 1;
-        uint64_t e_end = (i == device_count - 1) ? MAX_E : (e_start + e_per_gpu - 1);
-        gpu_e_ranges.emplace_back(e_start, e_end);
-    }
+    // Sort the ab_pows_vec based on sum to enable binary search
+    std::cout << "Sorting the a^4 + b^4 sums for binary search..." << std::endl;
+    std::sort(ab_pows_vec.begin(), ab_pows_vec.end(), [](const ABSum& lhs, const ABSum& rhs) -> bool {
+        return lhs.sum < rhs.sum;
+    });
+    std::cout << "Sorted the a^4 + b^4 sums for binary search." << std::endl;
 
-    // Display e ranges for each GPU (for debugging)
-    for (int i = 0; i < device_count; ++i) {
-        std::cout << "GPU " << i << " assigned e range: " << gpu_e_ranges[i].first << " to " << gpu_e_ranges[i].second << "\n";
-    }
+    // Split ab_pows_vec into separate arrays for sums, a, and b
+    size_t ab_size = ab_pows_vec.size();
+    std::vector<uint64_t> ab_sums_host(ab_size);
+    std::vector<uint64_t> ab_a_host(ab_size);
+    std::vector<uint64_t> ab_b_host(ab_size);
 
-    // Vectors to hold partial solutions from all GPUs
-    std::vector<std::vector<PartialSolution>> all_partial_solutions(device_count);
-    // Timers for each GPU
-    std::vector<float> gpu_times(device_count, 0.0f);
-
-    // Launch processing on all GPUs using separate host threads
-    std::vector<std::thread> gpu_threads;
-    for (int i = 0; i < device_count; ++i) {
-        gpu_threads.emplace_back(process_on_gpu, i, std::cref(a4b4_sums), std::cref(i_pows),
-                                 gpu_e_ranges[i].first, gpu_e_ranges[i].second,
-                                 std::ref(all_partial_solutions[i]),
-                                 std::ref(gpu_times[i]));
+    for (size_t i = 0; i < ab_size; ++i) {
+        ab_sums_host[i] = ab_pows_vec[i].sum;
+        ab_a_host[i] = ab_pows_vec[i].a;
+        ab_b_host[i] = ab_pows_vec[i].b;
     }
 
-    // Wait for all threads to finish
-    for (auto& th : gpu_threads) {
-        th.join();
+    // Free ab_pows_vec as it's no longer needed
+    ab_pows_vec.clear();
+    ab_pows_vec.shrink_to_fit();
+
+    // Initialize work queue with dynamically calculated chunk size
+    unsigned int numCPUs = std::thread::hardware_concurrency();
+    if (numCPUs == 0) numCPUs = 4; // Fallback to 4 if unable to detect
+    std::cout << "Number of CPU threads for work queue: " << numCPUs << std::endl;
+
+    std::vector<std::pair<uint64_t, uint64_t>> workChunks; // Each chunk contains [e_start, e_end]
+    initializeWorkQueue(MAX_E, numCPUs, workChunks);
+
+    // Divide work chunks between GPUs: GPU0 gets 1/3 and GPU1 gets 2/3
+    int deviceCount = 0;
+    cudaGetDeviceCount(&deviceCount);
+    if (deviceCount < 2) {
+        std::cerr << "This program requires at least two CUDA-capable GPUs." << std::endl;
+        return -1;
     }
+    std::cout << "Number of CUDA-capable GPUs detected: " << deviceCount << std::endl;
 
-    // Aggregate all partial solutions
-    std::vector<PartialSolution> aggregated_partial_solutions;
-    for (const auto& vec : all_partial_solutions) {
-        aggregated_partial_solutions.insert(aggregated_partial_solutions.end(), vec.begin(), vec.end());
-    }
-    std::cout << "Total partial solutions found: " << aggregated_partial_solutions.size() << "\n";
+    // For simplicity, use first two GPUs
+    int gpu0 = 0;
+    int gpu1 = 1;
 
-    // Iterate through all partial solutions and find corresponding a and b
-    std::vector<Solution> complete_solutions;
-    complete_solutions.reserve(aggregated_partial_solutions.size() * 2); // Estimate based on average (a,b) per sum
+    size_t total_chunks = workChunks.size();
+    size_t gpu0_chunks = total_chunks / 3;
+    // Removed gpu1_chunks as it's unused
 
-    for (const auto& partial : aggregated_partial_solutions) {
-        uint64_t remaining = i_pows[partial.e] - i_pows[partial.c] - i_pows[partial.d];
-        auto it = sum_to_ab_map.find(remaining);
-        if (it != sum_to_ab_map.end()) {
-            // For each (a, b) pair that sums to 'remaining', create a complete solution
-            for (const auto& ab_pair : it->second) {
-                // Enforce a <= b <= c <= d
-                if (ab_pair.second <= partial.c) { // Ensure b <= c
-                    Solution sol;
-                    sol.a = ab_pair.first;
-                    sol.b = ab_pair.second;
-                    sol.c = partial.c;
-                    sol.d = partial.d;
-                    sol.e = partial.e;
-                    complete_solutions.push_back(sol);
-                }
+    std::vector<std::pair<uint64_t, uint64_t>> gpu0_work(workChunks.begin(), workChunks.begin() + gpu0_chunks);
+    std::vector<std::pair<uint64_t, uint64_t>> gpu1_work(workChunks.begin() + gpu0_chunks, workChunks.end());
+
+    // Function to process GPU work
+    auto processGPU = [&](int device, const std::vector<std::pair<uint64_t, uint64_t>>& gpu_work, std::vector<Solution>& host_solutions, float& gpu_time) {
+        // Set the current device
+        cudaSetDevice(device);
+
+        // Allocate device memory for ab_sums, ab_a, ab_b
+        uint64_t* ab_sums_device;
+        uint64_t* ab_a_device;
+        uint64_t* ab_b_device;
+        size_t ab_size_device = ab_size;
+
+        cudaError_t err_code;
+
+        // Allocate and copy ab_sums
+        err_code = cudaMalloc(&ab_sums_device, ab_size_device * sizeof(uint64_t));
+        if (err_code != cudaSuccess) {
+            std::cerr << "CUDA malloc failed for ab_sums_device on device " << device << ": " << cudaGetErrorString(err_code) << std::endl;
+            return;
+        }
+        err_code = cudaMemcpy(ab_sums_device, ab_sums_host.data(), ab_size_device * sizeof(uint64_t), cudaMemcpyHostToDevice);
+        if (err_code != cudaSuccess) {
+            std::cerr << "CUDA memcpy failed for ab_sums_device on device " << device << ": " << cudaGetErrorString(err_code) << std::endl;
+            cudaFree(ab_sums_device);
+            return;
+        }
+
+        // Allocate and copy ab_a
+        err_code = cudaMalloc(&ab_a_device, ab_size_device * sizeof(uint64_t));
+        if (err_code != cudaSuccess) {
+            std::cerr << "CUDA malloc failed for ab_a_device on device " << device << ": " << cudaGetErrorString(err_code) << std::endl;
+            cudaFree(ab_sums_device);
+            return;
+        }
+        err_code = cudaMemcpy(ab_a_device, ab_a_host.data(), ab_size_device * sizeof(uint64_t), cudaMemcpyHostToDevice);
+        if (err_code != cudaSuccess) {
+            std::cerr << "CUDA memcpy failed for ab_a_device on device " << device << ": " << cudaGetErrorString(err_code) << std::endl;
+            cudaFree(ab_sums_device);
+            cudaFree(ab_a_device);
+            return;
+        }
+
+        // Allocate and copy ab_b
+        err_code = cudaMalloc(&ab_b_device, ab_size_device * sizeof(uint64_t));
+        if (err_code != cudaSuccess) {
+            std::cerr << "CUDA malloc failed for ab_b_device on device " << device << ": " << cudaGetErrorString(err_code) << std::endl;
+            cudaFree(ab_sums_device);
+            cudaFree(ab_a_device);
+            return;
+        }
+        err_code = cudaMemcpy(ab_b_device, ab_b_host.data(), ab_size_device * sizeof(uint64_t), cudaMemcpyHostToDevice);
+        if (err_code != cudaSuccess) {
+            std::cerr << "CUDA memcpy failed for ab_b_device on device " << device << ": " << cudaGetErrorString(err_code) << std::endl;
+            cudaFree(ab_sums_device);
+            cudaFree(ab_a_device);
+            cudaFree(ab_b_device);
+            return;
+        }
+
+        // Allocate device memory for solutions
+        Solution* d_solutions;
+        err_code = cudaMalloc(&d_solutions, MAX_SOLUTIONS_PER_GPU * sizeof(Solution));
+        if (err_code != cudaSuccess) {
+            std::cerr << "CUDA malloc failed for d_solutions on device " << device << ": " << cudaGetErrorString(err_code) << std::endl;
+            cudaFree(ab_sums_device);
+            cudaFree(ab_a_device);
+            cudaFree(ab_b_device);
+            return;
+        }
+        cudaMemset(d_solutions, 0, MAX_SOLUTIONS_PER_GPU * sizeof(Solution));
+
+        // Allocate device memory for solution count
+        unsigned long long int* d_solution_count;
+        err_code = cudaMalloc(&d_solution_count, sizeof(unsigned long long int));
+        if (err_code != cudaSuccess) {
+            std::cerr << "CUDA malloc failed for d_solution_count on device " << device << ": " << cudaGetErrorString(err_code) << std::endl;
+            cudaFree(ab_sums_device);
+            cudaFree(ab_a_device);
+            cudaFree(ab_b_device);
+            cudaFree(d_solutions);
+            return;
+        }
+        cudaMemset(d_solution_count, 0, sizeof(unsigned long long int));
+
+        // Allocate host memory for e_values and solutions per chunk
+        std::vector<uint64_t> h_e_values;
+        std::vector<Solution> h_solutions;
+        h_solutions.reserve(MAX_SOLUTIONS_PER_GPU);
+
+        // Start timing
+        cudaEvent_t start, stop;
+        cudaEventCreate(&start);
+        cudaEventCreate(&stop);
+        cudaEventRecord(start, 0);
+
+        // Iterate over work chunks assigned to this GPU
+        for (const auto& chunk : gpu_work) {
+            uint64_t e_start = chunk.first;
+            uint64_t e_end = chunk.second;
+            uint64_t num_es = e_end - e_start + 1;
+
+            // Create a host array for e_values
+            h_e_values.resize(num_es);
+            for (uint64_t i = 0; i < num_es; i++) {
+                h_e_values[i] = e_start + i;
             }
+
+            // Allocate device memory for e_values
+            uint64_t* d_e_values;
+            err_code = cudaMalloc(&d_e_values, num_es * sizeof(uint64_t));
+            if (err_code != cudaSuccess) {
+                std::cerr << "CUDA malloc failed for d_e_values on device " << device << ": " << cudaGetErrorString(err_code) << std::endl;
+                continue; // Skip this chunk
+            }
+
+            // Transfer e_values to device
+            err_code = cudaMemcpy(d_e_values, h_e_values.data(), num_es * sizeof(uint64_t), cudaMemcpyHostToDevice);
+            if (err_code != cudaSuccess) {
+                std::cerr << "CUDA memcpy failed for d_e_values on device " << device << ": " << cudaGetErrorString(err_code) << std::endl;
+                cudaFree(d_e_values);
+                continue; // Skip this chunk
+            }
+
+            // Determine optimal block and grid sizes
+            int blockSize = 256; // Must be multiple of 32
+            cudaDeviceProp deviceProp;
+            cudaGetDeviceProperties(&deviceProp, device);
+            int gridSize = (num_es + blockSize - 1) / blockSize;
+            gridSize = std::max(gridSize, static_cast<int>(deviceProp.multiProcessorCount * 32));
+
+            // Launch the kernel
+            processEsKernel<<<gridSize, blockSize>>>(
+                d_e_values, num_es,
+                ab_sums_device, ab_a_device, ab_b_device, ab_size_device,
+                d_solutions, d_solution_count,
+                MAX_SOLUTIONS_PER_GPU
+            );
+
+            // Check for kernel launch errors
+            err_code = cudaGetLastError();
+            if (err_code != cudaSuccess) {
+                std::cerr << "Kernel launch failed on device " << device << ": " << cudaGetErrorString(err_code) << std::endl;
+                cudaFree(d_e_values);
+                continue; // Skip to next chunk
+            }
+
+            // Synchronize to ensure kernel completion
+            cudaDeviceSynchronize();
+
+            // Free e_values device memory
+            cudaFree(d_e_values);
+        }
+
+        // Stop timing
+        cudaEventRecord(stop, 0);
+        cudaEventSynchronize(stop);
+        float milliseconds = 0;
+        cudaEventElapsedTime(&milliseconds, start, stop);
+        gpu_time = milliseconds / 1000.0f; // Convert to seconds
+
+        // Retrieve solution count
+        unsigned long long int h_solution_count = 0;
+        err_code = cudaMemcpy(&h_solution_count, d_solution_count, sizeof(unsigned long long int), cudaMemcpyDeviceToHost);
+        if (err_code != cudaSuccess) {
+            std::cerr << "CUDA memcpy failed for d_solution_count on device " << device << ": " << cudaGetErrorString(err_code) << std::endl;
+        }
+
+        // Allocate host memory for solutions
+        if (h_solution_count > 0) {
+            h_solutions.resize(h_solution_count);
+            err_code = cudaMemcpy(h_solutions.data(), d_solutions, h_solution_count * sizeof(Solution), cudaMemcpyDeviceToHost);
+            if (err_code != cudaSuccess) {
+                std::cerr << "CUDA memcpy failed for d_solutions on device " << device << ": " << cudaGetErrorString(err_code) << std::endl;
+            }
+        }
+
+        // Synchronize to ensure all copies are complete
+        cudaDeviceSynchronize();
+
+        // Append retrieved solutions to host_solutions
+        if (h_solution_count > 0) {
+            host_solutions.insert(host_solutions.end(), h_solutions.begin(), h_solutions.end());
+        }
+
+        // Cleanup
+        cudaFree(ab_sums_device);
+        cudaFree(ab_a_device);
+        cudaFree(ab_b_device);
+        cudaFree(d_solutions);
+        cudaFree(d_solution_count);
+        cudaEventDestroy(start);
+        cudaEventDestroy(stop);
+    };
+
+    // Combined solutions from both GPUs
+    std::vector<Solution> combinedSolutions;
+    combinedSolutions.reserve(MAX_SOLUTIONS_PER_GPU * 2); // Assuming two GPUs
+
+    // Variables to store GPU processing times
+    float gpu0_time = 0.0f;
+    float gpu1_time = 0.0f;
+
+    // Launch threads to process each GPU
+    std::thread gpu0_thread(processGPU, gpu0, gpu0_work, std::ref(combinedSolutions), std::ref(gpu0_time));
+    std::thread gpu1_thread(processGPU, gpu1, gpu1_work, std::ref(combinedSolutions), std::ref(gpu1_time));
+
+    // Wait for GPU threads to finish
+    gpu0_thread.join();
+    gpu1_thread.join();
+
+    std::cout << "GPU0 processing time: " << gpu0_time << " seconds." << std::endl;
+    std::cout << "GPU1 processing time: " << gpu1_time << " seconds." << std::endl;
+
+    // Record total computation end time
+    auto total_stop = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<float> total_duration = total_stop - total_start;
+
+    // Update totalSolutions based on combinedSolutions size
+    uint64_t totalSolutions = combinedSolutions.size();
+
+    // Display total solutions found
+    std::cout << "Total solutions found: " << totalSolutions << std::endl;
+
+    // Write solutions to a file
+    std::ofstream outfile("solutions.txt");
+    if (outfile.is_open()) {
+        uint64_t solutionNumber = 1;
+        for (const auto& sol : combinedSolutions) {
+            outfile << "Solution " << solutionNumber << ": " 
+                    << sol.a << "^4 + " 
+                    << sol.b << "^4 + " 
+                    << sol.c << "^4 + " 
+                    << sol.d << "^4 = " 
+                    << sol.e << "^4\n";
+            solutionNumber++;
+        }
+        outfile.close();
+        std::cout << "All solutions have been written to solutions.txt" << std::endl;
+    } else {
+        // If unable to open file, print to console (not recommended for large outputs)
+        uint64_t solutionNumber = 1;
+        for (const auto& sol : combinedSolutions) {
+            std::cout << "Solution " << solutionNumber << ": " 
+                      << sol.a << "^4 + " 
+                      << sol.b << "^4 + " 
+                      << sol.c << "^4 + " 
+                      << sol.d << "^4 = " 
+                      << sol.e << "^4" << std::endl;
+            solutionNumber++;
         }
     }
 
-    // Sort the complete solutions based on e, c, d, a, b
-    std::sort(complete_solutions.begin(), complete_solutions.end(),
-        [](const Solution& a, const Solution& b) -> bool {
-            if (a.e != b.e)
-                return a.e < b.e;
-            if (a.c != b.c)
-                return a.c < b.c;
-            if (a.d != b.d)
-                return a.d < b.d;
-            if (a.a != b.a)
-                return a.a < b.a;
-            return a.b < b.b;
-        });
-
-    // Display results
-    uint64_t totalSolutions = complete_solutions.size();
-    std::cout << "\nTotal complete solutions found: " << totalSolutions << "\n";
-
-    uint64_t solutionNumber = 1;
-    for (const auto& sol : complete_solutions) {
-        std::cout << "Solution " << solutionNumber << ": " 
-                  << sol.a << "^4 + " 
-                  << sol.b << "^4 + " 
-                  << sol.c << "^4 + " 
-                  << sol.d << "^4 = " 
-                  << sol.e << "^4\n";
-        solutionNumber++;
-    }
-
-    // Display computation times
-    for (int i = 0; i < device_count; ++i) {
-        std::cout << "\nGPU " << i << " (Device " << i << ") computation time: " << gpu_times[i] << " seconds.\n";
-    }
-
-    // Total computation time
-    auto total_stop = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<float> total_duration = total_stop - total_start;
-    std::cout << "Total computation time: " << total_duration.count() << " seconds.\n";
-
-    std::cout << "Computation completed successfully.\n";
+    // Display computation times in seconds
+    std::cout << "Total computation time: " << total_duration.count() << " seconds." << std::endl;
+    std::cout << "Computation completed successfully." << std::endl;
     return 0;
 }
