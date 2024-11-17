@@ -1,256 +1,415 @@
-// Filename: fourth_power_equation_multi_gpu.cu
-
-#include <iostream>
-#include <vector>
+// Compile with: nvcc -arch=sm_86 -o 4thpowerEquationCuda 4thpowerEquation.cu -O3
+#include <stdio.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
-#include <cstdint> // Include standard integer types
+#include <stdint.h>
+#include <stdlib.h>
+#include <unistd.h>  // For sleep function
 
-#define MAX_N 100000  // Set MAX_N to 100,000 as per your request
+#define MAX_D 1000000            // Reduced for testing
+#define MAX_SOLUTIONS 10000000 // Adjust as needed
+#define REPORT_INTERVAL 100   // Report every 10 d's
 
-// Error checking macro
-#define cudaCheckError(ans) { gpuAssert((ans), __FILE__, __LINE__); }
-inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true)
+typedef struct {
+    unsigned long long int low;
+    unsigned long long int high;
+} uint128;
+
+// Helper macro for CUDA error checking
+#define cudaCheckError() {                                          \
+    cudaError_t e=cudaGetLastError();                               \
+    if(e!=cudaSuccess) {                                            \
+        printf("CUDA Error %s:%d: %s\n", __FILE__, __LINE__,        \
+                cudaGetErrorString(e));                             \
+        exit(EXIT_FAILURE);                                         \
+    }                                                               \
+}
+
+// Device functions for 128-bit arithmetic
+__device__ uint128 add_uint128(uint128 a, uint128 b) {
+    uint128 result;
+    result.low = a.low + b.low;
+    result.high = a.high + b.high + (result.low < a.low ? 1 : 0);
+    return result;
+}
+
+__device__ uint128 subtract_uint128(uint128 a, uint128 b) {
+    uint128 result;
+    result.low = a.low - b.low;
+    result.high = a.high - b.high - (a.low < b.low ? 1 : 0);
+    return result;
+}
+
+__device__ int compare_uint128(uint128 a, uint128 b) {
+    if (a.high < b.high) return -1;
+    if (a.high > b.high) return 1;
+    if (a.low < b.low) return -1;
+    if (a.low > b.low) return 1;
+    return 0;
+}
+
+// Device function to compute i^4 as uint128 without using __int128
+__device__ uint128 compute_i4(unsigned long long int i) {
+    unsigned long long int i2_low = i * i;
+    unsigned long long int i2_high = 0; // i <= 100,000, i^2 fits in 64 bits
+
+    // Compute i^3 = i^2 * i
+    unsigned long long int i3_low = i2_low * i;
+    unsigned long long int carry = 0;
+    if (i2_low != 0 && i3_low / i2_low != i) {
+        carry = 1;
+    }
+    unsigned long long int i3_high = i2_high * i + carry;
+
+    // Compute i^4 = i^3 * i
+    unsigned long long int i4_low = i3_low * i;
+    carry = 0;
+    if (i3_low != 0 && i4_low / i3_low != i) {
+        carry = 1;
+    }
+    unsigned long long int i4_high = i3_high * i + carry;
+
+    uint128 result;
+    result.low = i4_low;
+    result.high = i4_high;
+    return result;
+}
+
+// Device function to perform linear search for a
+__device__ unsigned long long int find_a(uint128 required_a4, unsigned long long int b) {
+    for (unsigned long long int a = 1; a <= b; a++) {
+        uint128 a4 = compute_i4(a);
+        if (compare_uint128(a4, required_a4) == 0) {
+            return a;
+        }
+    }
+    return 0; // Not found
+}
+
+__global__ void find_solutions(
+    unsigned long long int min_d,
+    unsigned long long int max_d,
+    unsigned long long int *results,
+    unsigned long long int *result_count,
+    unsigned long long int *progress_counter) // Added progress counter
 {
-   if (code != cudaSuccess)
-   {
-      fprintf(stderr,"CUDA Error: %s %s %d\n", cudaGetErrorString(code), file, line);
-      if (abort) exit(code);
-   }
-}
+    unsigned long long int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long int total_d = max_d - min_d + 1;
 
-// Structure to simulate 128-bit integers using two 64-bit integers
-struct uint128_t {
-    uint64_t low;
-    uint64_t high;
+    // Each thread processes one value of d
+    if (idx >= total_d) return;
 
-    __host__ __device__
-    uint128_t() : low(0), high(0) {}
+    unsigned long long int d = min_d + idx;
+    uint128 d4 = compute_i4(d);
 
-    __host__ __device__
-    uint128_t(uint64_t l, uint64_t h) : low(l), high(h) {}
+    // Iterate over c, b, a with a <= b <= c <= d
+    for (unsigned long long int c = d; c >= 1; c--) {
+        uint128 c4 = compute_i4(c);
+        // Check if c^4 > d^4
+        if (compare_uint128(c4, d4) > 0) continue;
 
-    // Addition
-    __host__ __device__
-    uint128_t operator+(const uint128_t& other) const {
-        uint64_t new_low = low + other.low;
-        uint64_t carry = (new_low < low) ? 1 : 0;
-        uint64_t new_high = high + other.high + carry;
-        return uint128_t(new_low, new_high);
-    }
+        for (unsigned long long int b = c; b >= 1; b--) {
+            uint128 b4 = compute_i4(b);
+            uint128 cb_sum = add_uint128(c4, b4);
 
-    // Subtraction
-    __host__ __device__
-    uint128_t operator-(const uint128_t& other) const {
-        uint64_t new_low = low - other.low;
-        uint64_t borrow = (low < other.low) ? 1 : 0;
-        uint64_t new_high = high - other.high - borrow;
-        return uint128_t(new_low, new_high);
-    }
+            // Check if cb_sum > d^4
+            if (compare_uint128(cb_sum, d4) > 0) continue;
 
-    // Comparison operators
-    __host__ __device__
-    bool operator<(const uint128_t& other) const {
-        return (high < other.high) || (high == other.high && low < other.low);
-    }
+            // Calculate the required a^4 = d^4 - b^4 - c^4
+            uint128 required_a4 = subtract_uint128(d4, cb_sum);
 
-    __host__ __device__
-    bool operator>(const uint128_t& other) const {
-        return (high > other.high) || (high == other.high && low > other.low);
-    }
+            // Find a such that a^4 == required_a4 and a <= b
+            unsigned long long int a = find_a(required_a4, b);
 
-    __host__ __device__
-    bool operator==(const uint128_t& other) const {
-        return high == other.high && low == other.low;
-    }
-};
-
-// Host function to multiply two 64-bit integers and get a 128-bit result
-void multiply_64x64(uint64_t a, uint64_t b, uint64_t& high, uint64_t& low) {
-    __uint128_t result = (__uint128_t)a * (__uint128_t)b;
-    low = (uint64_t)(result & 0xFFFFFFFFFFFFFFFFULL);
-    high = (uint64_t)(result >> 64);
-}
-
-// Kernel function
-__global__ void find_solutions(uint64_t* d_fourth_powers_low, uint64_t* d_fourth_powers_high, int max_n, int start_e, int end_e) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int e = start_e + idx;
-
-    if (e > end_e || e > max_n || e <= 0) return; // Ensure e is within valid range
-
-    uint128_t e4 = uint128_t(d_fourth_powers_low[e - 1], d_fourth_powers_high[e - 1]);
-
-    for (int d = 1; d <= e && d <= max_n; ++d) {
-        uint128_t d4 = uint128_t(d_fourth_powers_low[d - 1], d_fourth_powers_high[d - 1]);
-        if (d4 > e4) break;
-
-        for (int c = 1; c <= d && c <= max_n; ++c) {
-            uint128_t c4 = uint128_t(d_fourth_powers_low[c - 1], d_fourth_powers_high[c - 1]);
-            if (d4 + c4 > e4) break;
-
-            uint128_t s = e4 - d4 - c4;
-
-            // Since a ≤ b ≤ c, and a, b ≤ c
-            for (int a = 1; a <= c && a <= max_n; ++a) {
-                uint128_t a4 = uint128_t(d_fourth_powers_low[a - 1], d_fourth_powers_high[a - 1]);
-                if (a4 > s) break;
-                uint128_t b4 = s - a4;
-
-                // Binary search for b in [a, c] such that b^4 == b4
-                int left = a;
-                int right = c;
-                while (left <= right) {
-                    int mid = left + (right - left) / 2;
-                    if (mid > max_n) {
-                        right = mid - 1;
-                        continue;
-                    }
-
-                    uint128_t b_candidate4 = uint128_t(d_fourth_powers_low[mid - 1], d_fourth_powers_high[mid - 1]);
-
-                    if (b_candidate4 == b4) {
-                        // Found a solution
-                        printf("Solution found: (a, b, c, d, e) = (%d, %d, %d, %d, %d)\n", a, mid, c, d, e);
-                        break;
-                    } else if (b_candidate4 < b4) {
-                        left = mid + 1;
-                    } else {
-                        right = mid - 1;
-                    }
+            if (a > 0) { // Found a valid a
+                // Atomically reserve space for the solution (4 entries: a, b, c, d)
+                unsigned long long int res_idx = atomicAdd(result_count, 4ULL);
+                if (res_idx + 4 <= MAX_SOLUTIONS * 4) {
+                    results[res_idx]     = a;
+                    results[res_idx + 1] = b;
+                    results[res_idx + 2] = c;
+                    results[res_idx + 3] = d;
                 }
             }
         }
     }
+
+    // Atomically increment the progress counter
+    unsigned long long int current_progress = atomicAdd(progress_counter, 1ULL) + 1ULL;
+
+    // Progress reporting within kernel (for debugging purposes)
+    if (current_progress % (REPORT_INTERVAL / 2) == 0) { // Report twice as frequently
+        printf("Thread %llu on device %d processed d = %llu\n", idx, blockIdx.x, d);
+    }
 }
 
-int main() {
-    // Precompute fourth powers on host
-    std::vector<uint128_t> fourth_powers(MAX_N);
-    for (int i = 0; i < MAX_N; ++i) {
-        uint64_t i64 = static_cast<uint64_t>(i + 1); // i from 1 to MAX_N
-        uint64_t i2_low, i2_high;
-        multiply_64x64(i64, i64, i2_high, i2_low); // i^2
-
-        // Compute i^4 = (i^2)^2
-        uint64_t i4_low, i4_high;
-        multiply_64x64(i2_low, i2_low, i4_high, i4_low);
-
-        // Add the cross terms
-        uint64_t cross_low, cross_high;
-        multiply_64x64(i2_low, i2_high * 2, cross_high, cross_low);
-
-        uint64_t final_low = i4_low + (cross_low << 1);
-        uint64_t carry = (final_low < i4_low) ? 1 : 0;
-        uint64_t final_high = i4_high + (cross_high << 1) + carry;
-
-        fourth_powers[i] = uint128_t(final_low, final_high);
-    }
-
-    // Get the number of devices
+int main()
+{
     int num_devices;
-    cudaCheckError(cudaGetDeviceCount(&num_devices));
-    std::cout << "Number of CUDA devices detected: " << num_devices << std::endl;
-    if (num_devices < 2) {
-        std::cerr << "Warning: Less than 2 CUDA devices detected. Adjusting to use available devices." << std::endl;
+    cudaGetDeviceCount(&num_devices);
+    if (num_devices < 2)
+    {
+        printf("This program requires at least 2 GPUs.\n");
+        return 1;
     }
-    num_devices = std::min(num_devices, 2); // Use up to 2 GPUs
 
-    // Measure execution time
+    // Create CUDA streams
+    cudaStream_t stream0, stream1;
+
+    // Device 0
+    cudaSetDevice(0);
+    cudaStreamCreate(&stream0);
+    cudaCheckError();
+
+    // Device 1
+    cudaSetDevice(1);
+    cudaStreamCreate(&stream1);
+    cudaCheckError();
+
+    // Allocate memory for results and result_count on each device
+    unsigned long long int *d_results0, *d_result_count0, *d_progress0;
+    unsigned long long int *d_results1, *d_result_count1, *d_progress1;
+
+    size_t results_size = MAX_SOLUTIONS * 4 * sizeof(unsigned long long int);
+
+    // Device 0 allocations
+    cudaSetDevice(0);
+    cudaMalloc((void**)&d_results0, results_size);
+    cudaCheckError();
+    cudaMalloc((void**)&d_result_count0, sizeof(unsigned long long int));
+    cudaCheckError();
+    cudaMalloc((void**)&d_progress0, sizeof(unsigned long long int)); // Allocate progress counter
+    cudaCheckError();
+    cudaMemset(d_result_count0, 0, sizeof(unsigned long long int));
+    cudaCheckError();
+    cudaMemset(d_progress0, 0, sizeof(unsigned long long int));     // Initialize progress counter
+    cudaCheckError();
+
+    // Device 1 allocations
+    cudaSetDevice(1);
+    cudaMalloc((void**)&d_results1, results_size);
+    cudaCheckError();
+    cudaMalloc((void**)&d_result_count1, sizeof(unsigned long long int));
+    cudaCheckError();
+    cudaMalloc((void**)&d_progress1, sizeof(unsigned long long int)); // Allocate progress counter
+    cudaCheckError();
+    cudaMemset(d_result_count1, 0, sizeof(unsigned long long int));
+    cudaCheckError();
+    cudaMemset(d_progress1, 0, sizeof(unsigned long long int));     // Initialize progress counter
+    cudaCheckError();
+
+    // Divide the range of d between two devices
+    unsigned long long int min_d0 = 1ULL;
+    unsigned long long int max_d0 = MAX_D / 2ULL;
+
+    unsigned long long int min_d1 = max_d0 + 1ULL;
+    unsigned long long int max_d1 = MAX_D;
+
+    // Start timing
     cudaEvent_t start, stop;
-    cudaCheckError(cudaEventCreate(&start));
-    cudaCheckError(cudaEventCreate(&stop));
+    cudaEventCreate(&start);
+    cudaCheckError();
+    cudaEventCreate(&stop);
+    cudaCheckError();
+    cudaEventRecord(start, 0);
+    cudaCheckError();
 
-    // Start timer
-    cudaCheckError(cudaEventRecord(start, 0));
+    // Launch kernels on both devices
+    int threadsPerBlock = 256;
+    int blocksPerGrid0 = ((max_d0 - min_d0 + 1ULL) + threadsPerBlock - 1) / threadsPerBlock;
+    int blocksPerGrid1 = ((max_d1 - min_d1 + 1ULL) + threadsPerBlock - 1) / threadsPerBlock;
 
-    // Assign e ranges as per your request
-    int start_e_array[] = {1, 67001};
-    int end_e_array[] = {67000, MAX_N};
+    // Device 0 kernel launch
+    cudaSetDevice(0);
+    find_solutions<<<blocksPerGrid0, threadsPerBlock, 0, stream0>>>(
+        min_d0,
+        max_d0,
+        d_results0,
+        d_result_count0,
+        d_progress0  // Pass progress counter
+    );
+    cudaCheckError();
 
-    std::vector<cudaStream_t> streams(num_devices);
-    std::vector<uint64_t*> d_fourth_powers_low(num_devices);
-    std::vector<uint64_t*> d_fourth_powers_high(num_devices);
+    // Device 1 kernel launch
+    cudaSetDevice(1);
+    find_solutions<<<blocksPerGrid1, threadsPerBlock, 0, stream1>>>(
+        min_d1,
+        max_d1,
+        d_results1,
+        d_result_count1,
+        d_progress1  // Pass progress counter
+    );
+    cudaCheckError();
 
-    // Use per-device memory allocations and copies
-    for (int device = 0; device < num_devices; ++device) {
-        cudaCheckError(cudaSetDevice(device));
+    // Variables to track progress
+    unsigned long long int h_progress0 = 0;
+    unsigned long long int h_progress1 = 0;
+    unsigned long long int next_report0 = REPORT_INTERVAL;
+    unsigned long long int next_report1 = REPORT_INTERVAL;
+    bool done0 = false;
+    bool done1 = false;
+    int timeout = 0;
+    const int MAX_TIMEOUT = 100; // e.g., 100 * 100ms = 10 seconds
 
-        // Allocate device memory
-        size_t size = MAX_N * sizeof(uint64_t);
-        cudaCheckError(cudaMalloc((void**)&d_fourth_powers_low[device], size));
-        cudaCheckError(cudaMalloc((void**)&d_fourth_powers_high[device], size));
+    // Polling loop for progress reporting
+    while (!done0 || !done1)
+    {
+        // Sleep for a short duration to avoid busy waiting
+        usleep(100000); // 100 milliseconds
+        timeout++;
 
-        // Copy data to device
-        cudaCheckError(cudaMemcpy(d_fourth_powers_low[device], &fourth_powers[0].low, size, cudaMemcpyHostToDevice));
-        cudaCheckError(cudaMemcpy(d_fourth_powers_high[device], &fourth_powers[0].high, size, cudaMemcpyHostToDevice));
+        // Check progress for Device 0
+        if (!done0) {
+            cudaSetDevice(0);
+            cudaMemcpy(&h_progress0, d_progress0, sizeof(unsigned long long int), cudaMemcpyDeviceToHost);
+            cudaCheckError();
 
-        // Create stream
-        cudaCheckError(cudaStreamCreate(&streams[device]));
-    }
+            while (h_progress0 >= next_report0 && next_report0 <= (max_d0 - min_d0 + 1ULL)) {
+                printf("Device 0: Processed %llu / %llu d's.\n", next_report0, max_d0 - min_d0 + 1ULL);
+                next_report0 += REPORT_INTERVAL;
+            }
 
-    // Set block size to 256 as per your request
-    int blockSize = 256;
+            // Check if Device 0 has finished processing
+            if (h_progress0 >= (max_d0 - min_d0 + 1ULL)) {
+                done0 = true;
+                printf("Device 0: Processing complete.\n");
+            }
+        }
 
-    for (int device = 0; device < num_devices; ++device) {
-        cudaCheckError(cudaSetDevice(device));
+        // Check progress for Device 1
+        if (!done1) {
+            cudaSetDevice(1);
+            cudaMemcpy(&h_progress1, d_progress1, sizeof(unsigned long long int), cudaMemcpyDeviceToHost);
+            cudaCheckError();
 
-        int current_device;
-        cudaCheckError(cudaGetDevice(&current_device));
-        printf("Launching kernel on Device %d\n", current_device);
+            while (h_progress1 >= next_report1 && next_report1 <= (max_d1 - min_d1 + 1ULL)) {
+                printf("Device 1: Processed %llu / %llu d's.\n", next_report1, max_d1 - min_d1 + 1ULL);
+                next_report1 += REPORT_INTERVAL;
+            }
 
-        int start_e = start_e_array[device];
-        int end_e = end_e_array[device];
+            // Check if Device 1 has finished processing
+            if (h_progress1 >= (max_d1 - min_d1 + 1ULL)) {
+                done1 = true;
+                printf("Device 1: Processing complete.\n");
+            }
+        }
 
-        if (end_e > MAX_N) end_e = MAX_N;
-
-        // Adjust grid size for each device
-        int num_elements = end_e - start_e + 1;
-        int gridSize = (num_elements + blockSize - 1) / blockSize;
-
-        if (gridSize < 1) gridSize = 1;
-
-        printf("Device %d: start_e = %d, end_e = %d, gridSize = %d\n", device, start_e, end_e, gridSize);
-
-        // Launch kernel on each device
-        find_solutions<<<gridSize, blockSize, 0, streams[device]>>>(d_fourth_powers_low[device], d_fourth_powers_high[device], MAX_N, start_e, end_e);
-
-        // Check for kernel launch errors
-        cudaError_t kernelErr = cudaGetLastError();
-        if (kernelErr != cudaSuccess) {
-            fprintf(stderr, "Kernel launch error on device %d: %s\n", device, cudaGetErrorString(kernelErr));
-            exit(EXIT_FAILURE);
+        // Implement timeout to prevent infinite loop
+        if (timeout > MAX_TIMEOUT) {
+            printf("Timeout reached. Exiting progress loop.\n");
+            break;
         }
     }
 
-    // Synchronize streams and devices
-    for (int device = 0; device < num_devices; ++device) {
-        cudaCheckError(cudaSetDevice(device));
-        cudaCheckError(cudaStreamSynchronize(streams[device]));
-    }
+    // Wait for kernels to finish
+    cudaSetDevice(0);
+    cudaStreamSynchronize(stream0);
+    cudaCheckError();
 
-    // Stop timer
-    cudaCheckError(cudaEventRecord(stop, 0));
-    cudaCheckError(cudaEventSynchronize(stop));
+    cudaSetDevice(1);
+    cudaStreamSynchronize(stream1);
+    cudaCheckError();
+
+    // Stop timing
+    cudaEventRecord(stop, 0);
+    cudaCheckError();
+    cudaEventSynchronize(stop);
+    cudaCheckError();
 
     // Calculate elapsed time
     float milliseconds = 0;
-    cudaCheckError(cudaEventElapsedTime(&milliseconds, start, stop));
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    float seconds = milliseconds / 1000.0f;
 
-    int total_seconds = static_cast<int>(milliseconds / 1000.0f);
-    int hours = total_seconds / 3600;
-    int minutes = (total_seconds % 3600) / 60;
-    int seconds = total_seconds % 60;
+    // Copy results back to host
+    unsigned long long int h_result_count0 = 0ULL;
+    unsigned long long int h_result_count1 = 0ULL;
 
-    std::cout << "Elapsed time: " << hours << "h " << minutes << "m " << seconds << "s\n";
+    cudaSetDevice(0);
+    cudaMemcpy(&h_result_count0, d_result_count0, sizeof(unsigned long long int), cudaMemcpyDeviceToHost);
+    cudaCheckError();
 
-    // Clean up
-    for (int device = 0; device < num_devices; ++device) {
-        cudaCheckError(cudaSetDevice(device));
-        cudaCheckError(cudaStreamDestroy(streams[device]));
-        cudaCheckError(cudaFree(d_fourth_powers_low[device]));
-        cudaCheckError(cudaFree(d_fourth_powers_high[device]));
+    cudaSetDevice(1);
+    cudaMemcpy(&h_result_count1, d_result_count1, sizeof(unsigned long long int), cudaMemcpyDeviceToHost);
+    cudaCheckError();
+
+    unsigned long long int *h_results0 = NULL;
+    unsigned long long int *h_results1 = NULL;
+
+    if (h_result_count0 > 0)
+    {
+        h_results0 = (unsigned long long int*)malloc(h_result_count0 * sizeof(unsigned long long int));
+        if (h_results0 == NULL) {
+            printf("Host memory allocation failed for results0.\n");
+            exit(EXIT_FAILURE);
+        }
+        cudaSetDevice(0);
+        cudaMemcpy(h_results0, d_results0, h_result_count0 * sizeof(unsigned long long int), cudaMemcpyDeviceToHost);
+        cudaCheckError();
     }
+
+    if (h_result_count1 > 0)
+    {
+        h_results1 = (unsigned long long int*)malloc(h_result_count1 * sizeof(unsigned long long int));
+        if (h_results1 == NULL) {
+            printf("Host memory allocation failed for results1.\n");
+            exit(EXIT_FAILURE);
+        }
+        cudaSetDevice(1);
+        cudaMemcpy(h_results1, d_results1, h_result_count1 * sizeof(unsigned long long int), cudaMemcpyDeviceToHost);
+        cudaCheckError();
+    }
+
+    // Print the results
+    printf("Solutions found on Device 0:\n");
+    for (unsigned long long int i = 0ULL; i < h_result_count0; i += 4ULL)
+    {
+        unsigned long long int a = h_results0[i];
+        unsigned long long int b = h_results0[i + 1];
+        unsigned long long int c = h_results0[i + 2];
+        unsigned long long int d = h_results0[i + 3];
+        printf("%llu^4 + %llu^4 + %llu^4 = %llu^4\n", a, b, c, d);
+    }
+
+    printf("Solutions found on Device 1:\n");
+    for (unsigned long long int i = 0ULL; i < h_result_count1; i += 4ULL)
+    {
+        unsigned long long int a = h_results1[i];
+        unsigned long long int b = h_results1[i + 1];
+        unsigned long long int c = h_results1[i + 2];
+        unsigned long long int d = h_results1[i + 3];
+        printf("%llu^4 + %llu^4 + %llu^4 = %llu^4\n", a, b, c, d);
+    }
+
+    printf("Total execution time: %f seconds\n", seconds);
+
+    // Cleanup
+    cudaSetDevice(0);
+    cudaFree(d_results0);
+    cudaCheckError();
+    cudaFree(d_result_count0);
+    cudaCheckError();
+    cudaFree(d_progress0); // Free progress counter
+    cudaCheckError();
+    cudaStreamDestroy(stream0);
+    cudaCheckError();
+    if (h_results0) free(h_results0);
+
+    cudaSetDevice(1);
+    cudaFree(d_results1);
+    cudaCheckError();
+    cudaFree(d_result_count1);
+    cudaCheckError();
+    cudaFree(d_progress1); // Free progress counter
+    cudaCheckError();
+    cudaStreamDestroy(stream1);
+    cudaCheckError();
+    if (h_results1) free(h_results1);
+
+    cudaEventDestroy(start);
+    cudaCheckError();
+    cudaEventDestroy(stop);
+    cudaCheckError();
 
     return 0;
 }
