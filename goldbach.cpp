@@ -1,4 +1,4 @@
-// sum_perfect_powers.cpp
+// goldbach.cpp
 
 #include <iostream>
 #include <cmath>
@@ -7,91 +7,73 @@
 #include <thread>
 #include <mutex>
 #include <chrono>
-#include <boost/multiprecision/cpp_int.hpp>
+#include <cstdint>
 
-// Use Boost multiprecision for large integers
-using boost::multiprecision::uint128_t;
+using namespace std;
 
-const uint64_t MAX_K = 1000000000000000000ULL; // 1e12
-const uint64_t MAX_M = static_cast<uint64_t>(std::pow(MAX_K, 0.5)) + 1;
+// Corrected: Use '__uint128_t' and define 'MAX_K' without exceeding 64-bit limits
+const __uint128_t MAX_K = (__uint128_t(1) * 1000000000000ULL * 1000000ULL * 1000ULL); // 1e21
+const uint64_t MAX_M = static_cast<uint64_t>(sqrt(static_cast<double>(MAX_K))) + 1;
 
-// Mutex for thread-safe access to the global set and sum
-std::mutex mutex_k_set;
-std::mutex mutex_sum;
+// Removed unused mutex_sum
+mutex mutex_k_set;
 
-// Global set to store unique k values
-std::unordered_set<uint64_t> global_k_set;
-
-// Global sum
+unordered_set<uint64_t> global_k_set;
 long double global_sum = 0.0;
 
 // Function to check if a number is a perfect power
 bool is_perfect_power(uint64_t m) {
-    uint64_t max_exponent = static_cast<uint64_t>(std::log2(m)) + 1;
-    for (uint64_t exponent = 2; exponent <= max_exponent; ++exponent) {
-        uint64_t low = 1;
-        uint64_t high = m;
-        while (low <= high) {
-            uint64_t mid = low + (high - low) / 2;
-            __uint128_t mid_e_power = 1;
-            for (uint64_t i = 0; i < exponent; ++i) {
-                mid_e_power *= mid;
-                if (mid_e_power > m) {
-                    break;
-                }
-            }
-            if (mid_e_power == m) {
-                return true;
-            } else if (mid_e_power < m) {
-                low = mid + 1;
-            } else {
-                high = mid - 1;
-            }
+    if (m <= 1) return false;
+    for (uint64_t e = 2; e <= log2(m); ++e) {
+        double root_d = pow(static_cast<double>(m), 1.0 / e);
+        uint64_t root = round(root_d);
+        __uint128_t power = 1;
+        for (uint64_t i = 0; i < e; ++i) {
+            power *= root;
+            if (power > m) break; // Early exit if power exceeds m
+        }
+        if (power == m) {
+            return true;
         }
     }
     return false;
 }
 
-// Worker function for each thread
+// Worker function for multithreading
 void worker(uint64_t start_m, uint64_t end_m) {
-    std::unordered_set<uint64_t> local_k_set;
-    long double local_sum = 0.0;
+    unordered_set<uint64_t> local_k_set;
 
     for (uint64_t m = start_m; m <= end_m; ++m) {
         if (is_perfect_power(m)) {
             continue;
         }
-        uint128_t k = m * m; // Start with n = 2
-        uint64_t n = 2;
-        while (k <= MAX_K) {
-            uint64_t k_uint64 = static_cast<uint64_t>(k);
-            local_k_set.insert(k_uint64);
-            n += 1;
+        __uint128_t k = m;
+        for (uint64_t n = 2; ; ++n) {
             k *= m;
             if (k > MAX_K) {
                 break;
             }
+            uint64_t k_uint64 = static_cast<uint64_t>(k);
+            local_k_set.insert(k_uint64);
         }
     }
 
     // Lock and update the global set and sum
-    {
-        std::lock_guard<std::mutex> lock(mutex_k_set);
-        for (const auto& k : local_k_set) {
-            if (global_k_set.insert(k).second) {
-                global_sum += 1.0L / (k - 1);
-            }
+    lock_guard<mutex> lock(mutex_k_set);
+    for (const auto& k : local_k_set) {
+        if (global_k_set.insert(k).second) {
+            global_sum += 1.0L / (k - 1);
         }
     }
 }
 
 int main() {
-    auto start_time = std::chrono::high_resolution_clock::now();
+    auto start_time = chrono::high_resolution_clock::now();
 
-    unsigned int num_threads = std::thread::hardware_concurrency();
-    if (num_threads == 0) num_threads = 4; // Default to 4 threads if hardware_concurrency is not defined
+    unsigned int num_threads = thread::hardware_concurrency();
+    if (num_threads == 0) num_threads = 4;
 
-    std::vector<std::thread> threads;
+    vector<thread> threads;
     uint64_t range = MAX_M / num_threads;
 
     for (unsigned int i = 0; i < num_threads; ++i) {
@@ -104,13 +86,13 @@ int main() {
         th.join();
     }
 
-    auto end_time = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> elapsed = end_time - start_time;
+    auto end_time = chrono::high_resolution_clock::now();
+    chrono::duration<double> elapsed = end_time - start_time;
 
-    std::cout.precision(15);
-    std::cout << "Sum S = " << global_sum << std::endl;
-    std::cout << "Total unique k values: " << global_k_set.size() << std::endl;
-    std::cout << "Time taken: " << elapsed.count() << " seconds" << std::endl;
+    cout.precision(15);
+    cout << "Sum S = " << global_sum << endl;
+    cout << "Total unique k values: " << global_k_set.size() << endl;
+    cout << "Time taken: " << elapsed.count() << " seconds" << endl;
 
     return 0;
 }
