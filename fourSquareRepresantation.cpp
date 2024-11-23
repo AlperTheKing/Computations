@@ -1,14 +1,15 @@
 #include <iostream>
-#include <fstream>
 #include <cmath>
 #include <thread>
 #include <vector>
 #include <atomic>
 #include <mutex>
 #include <chrono>
+#include <algorithm>
 
 // Function to check if n is expressible as the sum of two squares
 bool isSumOfTwoSquares(int64_t n) {
+    int64_t original_n = n;
     for (int64_t i = 2; i * i <= n; ++i) {
         int exponent = 0;
         if (n % i == 0) {
@@ -33,22 +34,25 @@ bool isOfFormFourK8MPlus7(int64_t n) {
     return n % 8 == 7;
 }
 
+// Struct to store representation
+struct Representation {
+    int64_t n;
+    std::string repr;
+};
+
 // Function executed by each thread to process a subset of numbers
 void processRange(int64_t start, int64_t end, std::atomic<int64_t>& count1, std::atomic<int64_t>& count2,
-                  std::atomic<int64_t>& count3, std::atomic<int64_t>& count4, std::mutex& file_mutex, std::ofstream& outfile) {
+                  std::atomic<int64_t>& count3, std::atomic<int64_t>& count4,
+                  std::vector<Representation>& last_values, std::mutex& last_values_mutex, int64_t UPPER_BOUND) {
     for (int64_t n = start; n <= end; ++n) {
         int squares_used = 4; // Default to four squares
+        std::string repr;
 
         // Check for one square
         int64_t root = static_cast<int64_t>(std::sqrt(n));
         if (root * root == n) {
             squares_used = 1;
-
-            // Optionally write the representation
-            {
-                std::lock_guard<std::mutex> guard(file_mutex);
-                outfile << n << " = " << root << "^2\n";
-            }
+            repr = std::to_string(n) + " = " + std::to_string(root) + "^2";
         }
         // Check for two squares
         else if (isSumOfTwoSquares(n)) {
@@ -62,19 +66,13 @@ void processRange(int64_t start, int64_t end, std::atomic<int64_t>& count1, std:
                 int64_t b = static_cast<int64_t>(std::sqrt(b2));
                 if (b >= a && b * b == b2) { // Ensure b >= a to avoid duplicates
                     found = true;
-                    {
-                        std::lock_guard<std::mutex> guard(file_mutex);
-                        outfile << n << " = " << a << "^2 + " << b << "^2\n";
-                    }
+                    repr = std::to_string(n) + " = " + std::to_string(a) + "^2 + " + std::to_string(b) + "^2";
                     break;
                 }
             }
             if (!found) {
                 // Should not happen due to the theorem, but include as a safety check
-                {
-                    std::lock_guard<std::mutex> guard(file_mutex);
-                    outfile << n << " = sum of two squares (representation not found)\n";
-                }
+                repr = std::to_string(n) + " = sum of two squares (representation not found)";
             }
         }
         // Check for three squares
@@ -92,31 +90,20 @@ void processRange(int64_t start, int64_t end, std::atomic<int64_t>& count1, std:
                     int64_t c = static_cast<int64_t>(std::sqrt(c2));
                     if (c >= b && c * c == c2) { // Ensure c >= b to avoid duplicates
                         found = true;
-                        {
-                            std::lock_guard<std::mutex> guard(file_mutex);
-                            outfile << n << " = " << a << "^2 + " << b << "^2 + " << c << "^2\n";
-                        }
+                        repr = std::to_string(n) + " = " + std::to_string(a) + "^2 + " + std::to_string(b) + "^2 + " + std::to_string(c) + "^2";
                         break;
                     }
                 }
             }
             if (!found) {
                 // Should not happen due to the theorem, but include as a safety check
-                {
-                    std::lock_guard<std::mutex> guard(file_mutex);
-                    outfile << n << " = sum of three squares (representation not found)\n";
-                }
+                repr = std::to_string(n) + " = sum of three squares (representation not found)";
             }
         }
         // Four squares
         else {
             squares_used = 4;
-
-            // Optionally write a default message
-            {
-                std::lock_guard<std::mutex> guard(file_mutex);
-                outfile << n << " = sum of four squares\n";
-            }
+            repr = std::to_string(n) + " = sum of four squares";
         }
 
         // Update counts
@@ -124,12 +111,18 @@ void processRange(int64_t start, int64_t end, std::atomic<int64_t>& count1, std:
         else if (squares_used == 2) count2++;
         else if (squares_used == 3) count3++;
         else count4++;
+
+        // If n >= UPPER_BOUND - 99, store the representation
+        if (n >= UPPER_BOUND - 99) {
+            std::lock_guard<std::mutex> guard(last_values_mutex);
+            last_values.push_back({n, repr});
+        }
     }
 }
 
 int main() {
     const int64_t LOWER_BOUND = 1;
-    const int64_t UPPER_BOUND = 1000000000; // 1e9
+    const int64_t UPPER_BOUND = 10000000000; // 1e10
     unsigned int NUM_THREADS = std::thread::hardware_concurrency();
     if (NUM_THREADS == 0) NUM_THREADS = 4; // Default to 4 threads if hardware_concurrency() returns 0
 
@@ -140,15 +133,9 @@ int main() {
     // Atomic counters for thread-safe updates
     std::atomic<int64_t> count1(0), count2(0), count3(0), count4(0);
 
-    // Open output file
-    std::ofstream outfile("representations.txt");
-    if (!outfile.is_open()) {
-        std::cerr << "Failed to open the output file.\n";
-        return 1;
-    }
-
-    // Mutex for thread-safe file writing
-    std::mutex file_mutex;
+    // Vector to store last 100 representations
+    std::vector<Representation> last_values;
+    std::mutex last_values_mutex;
 
     // Divide the range among threads
     std::vector<std::thread> threads;
@@ -171,7 +158,7 @@ int main() {
         }
 
         threads.emplace_back(processRange, current_start, current_end, std::ref(count1), std::ref(count2),
-                             std::ref(count3), std::ref(count4), std::ref(file_mutex), std::ref(outfile));
+                             std::ref(count3), std::ref(count4), std::ref(last_values), std::ref(last_values_mutex), UPPER_BOUND);
 
         current_start = current_end + 1;
     }
@@ -187,9 +174,16 @@ int main() {
 
     std::cout << "Processing completed in " << elapsed_seconds.count() << " seconds.\n";
 
-    // Close the output file
-    outfile.close();
-    std::cout << "Representations saved successfully to 'representations.txt'.\n";
+    // Print last 100 representations
+    std::cout << "\nLast 100 Representations:\n";
+    std::cout << "-------------------------\n";
+    // Sort last_values by n
+    std::sort(last_values.begin(), last_values.end(), [](const Representation& a, const Representation& b) {
+        return a.n < b.n;
+    });
+    for (const auto& rep : last_values) {
+        std::cout << rep.repr << "\n";
+    }
 
     // Output summary statistics
     std::cout << "\nSummary Statistics:\n";
