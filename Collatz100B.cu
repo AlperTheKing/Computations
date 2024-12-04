@@ -66,45 +66,92 @@ __host__ __device__ void increment_uint128(uint128* value, unsigned long long in
     }
 }
 
-// Modified multiply_uint128 function
-__host__ __device__ uint128 multiply_uint128(uint128 a, unsigned long long b) {
-    uint128 result = {0ULL, 0ULL};
+// Separate host and device versions of multiply_uint128
+
+// Device version using __umul64hi
+#if defined(__CUDA_ARCH__)
+__device__ uint128 multiply_uint128(uint128 a, unsigned long long b) {
+    uint128 result;
 
     unsigned long long a_low = a.low;
     unsigned long long a_high = a.high;
 
     unsigned long long low = a_low * b;
-    unsigned long long high = a_high * b;
-
-    // Check for carry from low to high
-    if (low < a_low * b) {
-        high += 1ULL;
-    }
+    unsigned long long carry = __umul64hi(a_low, b);
 
     result.low = low;
-    result.high = high;
+    result.high = a_high * b + carry;
 
     return result;
 }
+#else
+// Host version using standard arithmetic
+__host__ uint128 multiply_uint128(uint128 a, unsigned long long b) {
+    uint128 result = {0ULL, 0ULL};
+
+    unsigned long long a_low = a.low;
+    unsigned long long a_high = a.high;
+
+    // Split the numbers into 32-bit parts to avoid overflow
+    unsigned int a_low_low = (unsigned int)(a_low & 0xFFFFFFFFULL);
+    unsigned int a_low_high = (unsigned int)(a_low >> 32);
+    unsigned int a_high_low = (unsigned int)(a_high & 0xFFFFFFFFULL);
+    unsigned int a_high_high = (unsigned int)(a_high >> 32);
+
+    unsigned int b_low = (unsigned int)(b & 0xFFFFFFFFULL);
+    unsigned int b_high = (unsigned int)(b >> 32);
+
+    // Perform multiplication
+    unsigned long long ll = (unsigned long long)a_low_low * b_low;
+    unsigned long long lh = (unsigned long long)a_low_high * b_low;
+    unsigned long long hl = (unsigned long long)a_low_low * b_high;
+    unsigned long long hh = (unsigned long long)a_low_high * b_high;
+
+    // Calculate intermediate sums
+    unsigned long long mid1 = lh + hl;
+    unsigned long long mid2 = hh;
+
+    // Adjust for carries
+    unsigned long long carry = (mid1 < lh) ? (1ULL << 32) : 0ULL;
+
+    // Combine results
+    result.low = ll + (mid1 << 32);
+    if (result.low < ll) carry++;
+
+    result.high = a_high * b + mid2 + (mid1 >> 32) + carry;
+
+    return result;
+}
+#endif
 
 // Function to divide uint128 by a small unsigned int
 __host__ uint128 divide_uint128_by_uint32(uint128 dividend, uint32_t divisor) {
     uint128 result = {0ULL, 0ULL};
-    uint128 temp = {dividend.low, dividend.high};
+    uint128 remainder = {0ULL, 0ULL};
 
-    // If high part is zero, we can perform simple division
-    if (temp.high == 0) {
-        result.low = temp.low / divisor;
-        result.high = 0;
-    } else {
-        // Perform division on 128-bit number
-        // Split dividend into two 64-bit parts
-        unsigned __int128 dividend_128 = ((__int128)temp.high << 64) | temp.low;
-        unsigned __int128 result_128 = dividend_128 / divisor;
-        result.low = (unsigned long long)(result_128 & 0xFFFFFFFFFFFFFFFFULL);
-        result.high = (unsigned long long)(result_128 >> 64);
+    for (int i = 127; i >= 0; --i) {
+        // Left shift remainder by 1
+        remainder.high = (remainder.high << 1) | (remainder.low >> 63);
+        remainder.low = (remainder.low << 1);
+
+        // Bring down the next bit of the dividend
+        if (i >= 64) {
+            remainder.low |= (dividend.high >> (i - 64)) & 1ULL;
+        } else {
+            remainder.low |= (dividend.low >> i) & 1ULL;
+        }
+
+        // If remainder >= divisor
+        if (remainder.high > 0 || remainder.low >= divisor) {
+            remainder.low -= divisor;
+            // Set the corresponding bit in the result
+            if (i >= 64) {
+                result.high |= (1ULL << (i - 64));
+            } else {
+                result.low |= (1ULL << i);
+            }
+        }
     }
-
     return result;
 }
 
@@ -124,7 +171,8 @@ void print_uint128(uint128 a) {
         std::cout << a.low;
     } else {
         // For large numbers, print high and low parts
-        std::cout << a.high << std::setw(20) << std::setfill('0') << a.low;
+        std::cout << a.high;
+        std::cout << std::setw(20) << std::setfill('0') << a.low;
     }
 }
 
@@ -157,7 +205,7 @@ __global__ void find_max_collatz_steps_in_range(uint128 start, uint128 end,
                                                 unsigned long long *d_max_steps,
                                                 uint128 *d_number_with_max_steps) {
     unsigned long long idx = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned long long stride = gridDim.x * blockDim.x;
+    unsigned long long stride = (unsigned long long)gridDim.x * blockDim.x;
 
     uint128 current = start;
     increment_uint128(&current, idx);
@@ -217,23 +265,8 @@ void gpu_compute(int gpu_id, uint128 start, uint128 end,
         0,  // dynamic shared memory per block
         0)); // block size limit
 
-    // Compute total number of elements (numbers) in the range
-    // Since total_numbers can be very large, we limit the grid size to a reasonable number
-    unsigned long long total_numbers = 0;
-    if (end.high == start.high) {
-        total_numbers = end.low - start.low + 1;
-    } else {
-        // If the high parts are different, the range is too large to represent in 64 bits
-        total_numbers = ~0ULL; // Set to maximum possible value
-    }
-
-    int gridSize = (total_numbers + blockSize - 1) / blockSize;
-
-    // Limit gridSize to a maximum value to prevent excessive resource usage
-    int maxGridSize = 65535; // Maximum grid size per dimension
-    if (gridSize > maxGridSize) {
-        gridSize = maxGridSize;
-    }
+    // Compute grid size
+    int gridSize = minGridSize;
 
     // Debug: Print GPU ID and assigned range
     std::cout << "GPU " << gpu_id << " processing range: Start = ";
@@ -272,7 +305,7 @@ int main() {
     }
 
     // Generate powers of 10 from 10^0 to 10^n (n <= 38 due to uint128 limitations)
-    const unsigned int max_exponent = 20; // Adjust as needed, max 38
+    const unsigned int max_exponent = 14; // Adjust as needed, max 38
     std::vector<uint128> powers_of_10;
 
     for (unsigned int i = 0; i <= max_exponent + 1; ++i) {
@@ -287,10 +320,6 @@ int main() {
     for (size_t range_idx = 0; range_idx < powers_of_10.size() - 1; ++range_idx) {
         uint128 start = powers_of_10[range_idx];
         uint128 end = subtract_uint128(powers_of_10[range_idx + 1], {1ULL, 0ULL});
-
-        // Calculate the total range
-        uint128 total_range = subtract_uint128(end, start);
-        increment_uint128(&total_range, 1ULL); // total_range = end - start + 1
 
         // Variables to hold the maximum steps and corresponding numbers from each GPU
         std::vector<unsigned long long> max_steps_per_gpu(device_count, 0);
@@ -308,7 +337,10 @@ int main() {
         // Split the total range among GPUs
         std::vector<std::pair<uint128, uint128>> gpu_ranges(device_count);
 
-        // Calculate the size of each subrange
+        // Calculate the total range
+        uint128 total_range = subtract_uint128(end, start);
+        increment_uint128(&total_range, 1ULL); // total_range = end - start + 1
+
         uint128 one = {1ULL, 0ULL};
 
         for (int i = 0; i < device_count; ++i) {
