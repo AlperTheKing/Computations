@@ -73,58 +73,38 @@ __host__ __device__ uint128 multiply_uint128(uint128 a, unsigned long long b) {
     unsigned long long a_low = a.low;
     unsigned long long a_high = a.high;
 
-    unsigned int al_low = (unsigned int)(a_low & 0xFFFFFFFFULL);
-    unsigned int al_high = (unsigned int)(a_low >> 32);
+    unsigned long long low = a_low * b;
+    unsigned long long high = a_high * b;
 
-    unsigned int b_low = (unsigned int)(b & 0xFFFFFFFFULL);
-    unsigned int b_high = (unsigned int)(b >> 32);
+    // Check for carry from low to high
+    if (low < a_low * b) {
+        high += 1ULL;
+    }
 
-    // Compute partial products
-    unsigned long long ll = (unsigned long long)al_low * b_low;
-    unsigned long long lh = (unsigned long long)al_low * b_high;
-    unsigned long long hl = (unsigned long long)al_high * b_low;
-    unsigned long long hh = (unsigned long long)al_high * b_high;
-
-    // Combine partial products
-    unsigned long long mid = lh + hl;
-    unsigned long long carry = (mid < lh) ? (1ULL << 32) : 0ULL;
-
-    result.low = ll + (mid << 32);
-    if (result.low < ll) carry++;
-
-    result.high = a_high * b + hh + (mid >> 32) + carry;
+    result.low = low;
+    result.high = high;
 
     return result;
 }
 
-// Function to divide uint128 by an unsigned int
-__host__ uint128 divide_uint128(uint128 dividend, unsigned int divisor) {
+// Function to divide uint128 by a small unsigned int
+__host__ uint128 divide_uint128_by_uint32(uint128 dividend, uint32_t divisor) {
     uint128 result = {0ULL, 0ULL};
-    uint128 remainder = {0ULL, 0ULL};
+    uint128 temp = {dividend.low, dividend.high};
 
-    for (int i = 127; i >= 0; --i) {
-        // Left shift remainder by 1
-        remainder.high = (remainder.high << 1) | (remainder.low >> 63);
-        remainder.low = (remainder.low << 1);
-
-        // Bring down the next bit of the dividend
-        if (i >= 64) {
-            remainder.low |= (dividend.high >> (i - 64)) & 1ULL;
-        } else {
-            remainder.low |= (dividend.low >> i) & 1ULL;
-        }
-
-        // If remainder >= divisor
-        if (remainder.high > 0 || remainder.low >= divisor) {
-            remainder.low -= divisor;
-            // Set the corresponding bit in the result
-            if (i >= 64) {
-                result.high |= (1ULL << (i - 64));
-            } else {
-                result.low |= (1ULL << i);
-            }
-        }
+    // If high part is zero, we can perform simple division
+    if (temp.high == 0) {
+        result.low = temp.low / divisor;
+        result.high = 0;
+    } else {
+        // Perform division on 128-bit number
+        // Split dividend into two 64-bit parts
+        unsigned __int128 dividend_128 = ((__int128)temp.high << 64) | temp.low;
+        unsigned __int128 result_128 = dividend_128 / divisor;
+        result.low = (unsigned long long)(result_128 & 0xFFFFFFFFFFFFFFFFULL);
+        result.high = (unsigned long long)(result_128 >> 64);
     }
+
     return result;
 }
 
@@ -227,14 +207,33 @@ void gpu_compute(int gpu_id, uint128 start, uint128 end,
     cudaCheckError(cudaMemset(d_max_steps, 0, sizeof(unsigned long long)));
     cudaCheckError(cudaMemset(d_number_with_max_steps, 0, sizeof(uint128)));
 
-    // Determine optimal block size and grid size
-    int device;
-    cudaDeviceProp deviceProp;
-    cudaCheckError(cudaGetDevice(&device));
-    cudaCheckError(cudaGetDeviceProperties(&deviceProp, device));
+    // Determine optimal block size and grid size using cudaOccupancyMaxPotentialBlockSize
+    int minGridSize = 0;
+    int blockSize = 0;
+    cudaCheckError(cudaOccupancyMaxPotentialBlockSize(
+        &minGridSize,
+        &blockSize,
+        find_max_collatz_steps_in_range,
+        0,  // dynamic shared memory per block
+        0)); // block size limit
 
-    int blockSize = 256; // Adjust based on your GPU
-    int gridSize = (deviceProp.maxThreadsPerMultiProcessor * deviceProp.multiProcessorCount) / blockSize;
+    // Compute total number of elements (numbers) in the range
+    // Since total_numbers can be very large, we limit the grid size to a reasonable number
+    unsigned long long total_numbers = 0;
+    if (end.high == start.high) {
+        total_numbers = end.low - start.low + 1;
+    } else {
+        // If the high parts are different, the range is too large to represent in 64 bits
+        total_numbers = ~0ULL; // Set to maximum possible value
+    }
+
+    int gridSize = (total_numbers + blockSize - 1) / blockSize;
+
+    // Limit gridSize to a maximum value to prevent excessive resource usage
+    int maxGridSize = 65535; // Maximum grid size per dimension
+    if (gridSize > maxGridSize) {
+        gridSize = maxGridSize;
+    }
 
     // Debug: Print GPU ID and assigned range
     std::cout << "GPU " << gpu_id << " processing range: Start = ";
@@ -293,23 +292,6 @@ int main() {
         uint128 total_range = subtract_uint128(end, start);
         increment_uint128(&total_range, 1ULL); // total_range = end - start + 1
 
-        // Split the total range among GPUs
-        std::vector<std::pair<uint128, uint128>> gpu_ranges(device_count);
-
-        // Calculate the size of each subrange
-        uint128 range_size = divide_uint128(total_range, device_count);
-
-        uint128 one = {1ULL, 0ULL};
-
-        for (int i = 0; i < device_count; ++i) {
-            gpu_ranges[i].first = add_uint128(start, multiply_uint128(range_size, i));
-            if (i == device_count - 1) {
-                gpu_ranges[i].second = end;
-            } else {
-                gpu_ranges[i].second = subtract_uint128(add_uint128(gpu_ranges[i].first, range_size), one);
-            }
-        }
-
         // Variables to hold the maximum steps and corresponding numbers from each GPU
         std::vector<unsigned long long> max_steps_per_gpu(device_count, 0);
         std::vector<uint128> number_with_max_steps_per_gpu(device_count);
@@ -322,6 +304,33 @@ int main() {
 
         // Start timing for this range
         auto range_start_time = std::chrono::high_resolution_clock::now();
+
+        // Split the total range among GPUs
+        std::vector<std::pair<uint128, uint128>> gpu_ranges(device_count);
+
+        // Calculate the size of each subrange
+        uint128 one = {1ULL, 0ULL};
+
+        for (int i = 0; i < device_count; ++i) {
+            // Calculate start offset
+            uint128 index = {static_cast<unsigned long long>(i), 0ULL};
+            uint128 range_offset = multiply_uint128(total_range, index.low);
+            range_offset = divide_uint128_by_uint32(range_offset, device_count);
+
+            gpu_ranges[i].first = add_uint128(start, range_offset);
+
+            // Calculate end offset
+            uint128 next_index = {static_cast<unsigned long long>(i + 1), 0ULL};
+            uint128 next_range_offset = multiply_uint128(total_range, next_index.low);
+            next_range_offset = divide_uint128_by_uint32(next_range_offset, device_count);
+
+            gpu_ranges[i].second = subtract_uint128(add_uint128(start, next_range_offset), one);
+
+            // Ensure that the last GPU's end range is correct
+            if (i == device_count - 1) {
+                gpu_ranges[i].second = end;
+            }
+        }
 
         // Create and start threads for each GPU
         std::vector<std::thread> gpu_threads(device_count);
