@@ -33,7 +33,7 @@ constexpr int kOrbitBreakOrbits = 2;
 constexpr int kOrbitBreakPerOrbit = kOrbitBreakHarmonics * kOrbitBreakProperties;
 constexpr int kOrbitBreakDim = kOrbitBreakOrbits * kOrbitBreakPerOrbit;
 constexpr int kMaxRingCount = 3;
-constexpr int kStrategyCount = 6;
+constexpr int kStrategyCount = 7;
 constexpr double kPi = 3.141592653589793238462643383279502884;
 constexpr double kTwoPi = 2.0 * kPi;
 constexpr double kValidMarginTol = -1e-9;
@@ -116,6 +116,7 @@ enum class StrategyId {
     RingPartition = 3,
     CompressedContinuation = 4,
     RelaxedWave = 5,
+    IslandDE = 6,
 };
 
 struct StrategyCounters {
@@ -193,8 +194,8 @@ struct SharedBest {
 
 struct Options {
     int threads = 0;
-    double seconds = 60.0;
-    bool run_until_interrupt = false;
+    double seconds = 0.0;
+    bool run_until_interrupt = true;
     int checkpoint_seconds = 300;
     bool no_resume = false;
     std::size_t archive_size = 24;
@@ -211,6 +212,11 @@ struct BestSnapshot {
     std::vector<CandidateRecord> official_archive;
     std::vector<CandidateRecord> relaxed_archive;
     std::array<StrategyCounters, kStrategyCount> strategy_counters{};
+};
+
+struct IslandIndividual {
+    ParamVector x{};
+    ObjectiveSummary summary{};
 };
 
 Layout rotate_layout(Layout layout, double angle);
@@ -439,6 +445,7 @@ const char* strategy_name(StrategyId strategy) {
         case StrategyId::RingPartition: return "ring_partition";
         case StrategyId::CompressedContinuation: return "compressed_continuation";
         case StrategyId::RelaxedWave: return "relaxed_wave";
+        case StrategyId::IslandDE: return "island_de";
     }
     return "unknown";
 }
@@ -3084,6 +3091,362 @@ bool strict_refine_and_publish(
     const std::vector<ObjectivePhase>& phases,
     const std::vector<ObjectivePhase>& repair_phases,
     std::chrono::steady_clock::time_point deadline
+);
+
+bool record_relaxed_then_repair(
+    SharedBest& shared,
+    Layout layout,
+    int thread_id,
+    StrategyId strategy_id,
+    const std::string& strategy_label,
+    const ObjectivePhase& relaxed_archive_phase,
+    const std::vector<ObjectivePhase>& phases,
+    const std::vector<ObjectivePhase>& repair_phases,
+    std::chrono::steady_clock::time_point deadline
+);
+
+bool better_summary(const ObjectiveSummary& lhs, const ObjectiveSummary& rhs) {
+    if (lhs.cost != rhs.cost) {
+        return lhs.cost < rhs.cost;
+    }
+    if (lhs.exact_radius != rhs.exact_radius) {
+        return lhs.exact_radius < rhs.exact_radius;
+    }
+    return lhs.min_margin > rhs.min_margin;
+}
+
+ParamVector centered_seed_vector(Layout layout) {
+    ParamVector x = to_vector(layout);
+    center_by_mec(x);
+    normalize_angles(x);
+    return x;
+}
+
+std::optional<ParamVector> sample_archive_vector(
+    const std::vector<CandidateRecord>& archive,
+    std::size_t limit,
+    std::mt19937_64& rng
+) {
+    if (archive.empty()) {
+        return std::nullopt;
+    }
+    const std::size_t capped = std::min(limit, archive.size());
+    std::uniform_int_distribution<int> pick(0, static_cast<int>(capped - 1));
+    return centered_seed_vector(archive[static_cast<std::size_t>(pick(rng))].layout);
+}
+
+double sample_cauchy_positive(std::mt19937_64& rng, double location, double scale) {
+    std::cauchy_distribution<double> dist(location, scale);
+    for (int attempt = 0; attempt < 32; ++attempt) {
+        const double value = dist(rng);
+        if (std::isfinite(value) && value > 0.0) {
+            return std::min(value, 1.0);
+        }
+    }
+    return std::clamp(location, 0.05, 1.0);
+}
+
+double sample_normal_clipped(std::mt19937_64& rng, double mean, double sigma) {
+    std::normal_distribution<double> dist(mean, sigma);
+    double value = dist(rng);
+    if (!std::isfinite(value)) {
+        value = mean;
+    }
+    return std::clamp(value, 0.0, 1.0);
+}
+
+ObjectivePhase island_de_phase(double fraction) {
+    if (fraction < 0.25) {
+        return {150.0, 0.0200, 0.0200, -1.0e-5, 0, 4};
+    }
+    if (fraction < 0.55) {
+        return {220.0, 0.0100, 0.0100, -3.5e-5, 0, 4};
+    }
+    if (fraction < 0.82) {
+        return {320.0, 0.0060, 0.0060, -5.5e-5, 0, 4};
+    }
+    return {460.0, 0.0032, 0.0032, -6.5e-5, 0, 4};
+}
+
+ParamVector choose_island_seed_vector(
+    std::mt19937_64& rng,
+    SharedBest& shared,
+    const std::vector<Layout>& base_seeds,
+    const std::vector<CandidateRecord>& official_archive,
+    const std::vector<CandidateRecord>& relaxed_archive
+) {
+    std::uniform_real_distribution<double> coin(0.0, 1.0);
+
+    Layout seed = choose_seed(rng, shared, base_seeds);
+    const double source_pick = coin(rng);
+    if (source_pick < 0.30) {
+        if (auto archived = sample_archive_vector(official_archive, 10, rng); archived.has_value()) {
+            return *archived;
+        }
+    } else if (source_pick < 0.52) {
+        if (auto archived = sample_archive_vector(relaxed_archive, 12, rng); archived.has_value()) {
+            return *archived;
+        }
+    }
+
+    const double transform_pick = coin(rng);
+    if (transform_pick < 0.25) {
+        seed = compress_best_seed(seed, rng);
+    } else if (transform_pick < 0.55) {
+        seed = jitter_layout(seed, rng, 0.018, 0.032, 0.0035);
+    } else if (transform_pick < 0.82) {
+        seed = jitter_layout(seed, rng, 0.032, 0.060, 0.0060);
+        seed = low_frequency_distort_layout(seed, rng, 0.020, 0.040);
+    } else {
+        seed = random_shell_seed(rng);
+    }
+    return centered_seed_vector(seed);
+}
+
+void reevaluate_island_population(std::vector<IslandIndividual>& population, const ObjectivePhase& phase) {
+    for (IslandIndividual& individual : population) {
+        individual.summary = objective_value(individual.x, phase);
+    }
+}
+
+bool run_island_de_strategy(
+    SharedBest& shared,
+    int thread_id,
+    const std::string& strategy_label,
+    std::mt19937_64& rng,
+    const std::vector<Layout>& base_seeds,
+    const ObjectivePhase& relaxed_archive_phase,
+    const std::vector<ObjectivePhase>& strict_phases,
+    const std::vector<ObjectivePhase>& repair_phases,
+    double budget,
+    std::chrono::steady_clock::time_point deadline
+) {
+    std::uniform_real_distribution<double> coin(0.0, 1.0);
+    const std::vector<CandidateRecord> official_archive = snapshot_official_archive(shared);
+    const std::vector<CandidateRecord> relaxed_archive = snapshot_relaxed_archive(shared);
+
+    const int pop_size = std::max(8, static_cast<int>(std::lround(8.0 + 10.0 * budget)));
+    const int max_generations = std::max(6, static_cast<int>(std::lround(10.0 + 18.0 * budget)));
+    const int pbest_count = std::max(2, static_cast<int>(std::lround(0.22 * static_cast<double>(pop_size))));
+    const int restart_threshold = std::max(5, static_cast<int>(std::lround(7.0 + 7.0 * budget)));
+    const std::size_t archive_limit = static_cast<std::size_t>(std::max(pop_size, 3 * pop_size));
+
+    std::vector<IslandIndividual> population;
+    population.reserve(static_cast<std::size_t>(pop_size));
+    const ObjectivePhase initial_phase = island_de_phase(0.0);
+    for (int i = 0; i < pop_size; ++i) {
+        ParamVector seed = choose_island_seed_vector(rng, shared, base_seeds, official_archive, relaxed_archive);
+        if (i == 0) {
+            if (auto best = snapshot_best(shared); best.has_value()) {
+                seed = centered_seed_vector(*best);
+            }
+        }
+        population.push_back({seed, objective_value(seed, initial_phase)});
+    }
+
+    auto sort_population = [&]() {
+        std::sort(population.begin(), population.end(), [](const IslandIndividual& lhs, const IslandIndividual& rhs) {
+            return better_summary(lhs.summary, rhs.summary);
+        });
+    };
+
+    std::vector<ParamVector> archive;
+    archive.reserve(archive_limit);
+    double mu_f = 0.55;
+    double mu_cr = 0.80;
+    double best_cost_seen = std::numeric_limits<double>::infinity();
+    int stagnation = 0;
+    int last_phase_bucket = -1;
+
+    for (int generation = 0; generation < max_generations && !search_should_stop(deadline); ++generation) {
+        const double fraction = (max_generations <= 1)
+            ? 1.0
+            : static_cast<double>(generation) / static_cast<double>(max_generations - 1);
+        const ObjectivePhase phase = island_de_phase(fraction);
+        const int phase_bucket = static_cast<int>(std::floor(fraction * 4.0));
+        if (phase_bucket != last_phase_bucket) {
+            reevaluate_island_population(population, phase);
+            last_phase_bucket = phase_bucket;
+        }
+
+        sort_population();
+        if (population.front().summary.cost + 1e-12 < best_cost_seen) {
+            best_cost_seen = population.front().summary.cost;
+            stagnation = 0;
+        } else {
+            ++stagnation;
+        }
+
+        if ((generation + 1) % 4 == 0 && !search_should_stop(deadline)) {
+            ParamVector injected = choose_island_seed_vector(rng, shared, base_seeds, official_archive, relaxed_archive);
+            population.back() = {injected, objective_value(injected, phase)};
+        }
+
+        if (stagnation >= restart_threshold && !search_should_stop(deadline)) {
+            const int replace_count = std::max(2, pop_size / 4);
+            for (int i = 0; i < replace_count; ++i) {
+                ParamVector reset = choose_island_seed_vector(rng, shared, base_seeds, official_archive, relaxed_archive);
+                population[population.size() - 1 - static_cast<std::size_t>(i)] = {
+                    reset,
+                    objective_value(reset, phase),
+                };
+            }
+            archive.clear();
+            stagnation = 0;
+            sort_population();
+        }
+
+        std::vector<double> successful_f;
+        std::vector<double> successful_cr;
+        successful_f.reserve(static_cast<std::size_t>(pop_size));
+        successful_cr.reserve(static_cast<std::size_t>(pop_size));
+
+        for (int i = 0; i < pop_size && !search_should_stop(deadline); ++i) {
+            const double f = sample_cauchy_positive(rng, mu_f, 0.10);
+            const double cr = sample_normal_clipped(rng, mu_cr, 0.10);
+            const int pbest = std::uniform_int_distribution<int>(0, pbest_count - 1)(rng);
+
+            int r1 = i;
+            while (r1 == i) {
+                r1 = std::uniform_int_distribution<int>(0, pop_size - 1)(rng);
+            }
+
+            ParamVector xr2{};
+            bool have_xr2 = false;
+            if (!archive.empty() && coin(rng) < 0.35) {
+                xr2 = archive[static_cast<std::size_t>(
+                    std::uniform_int_distribution<int>(0, static_cast<int>(archive.size()) - 1)(rng)
+                )];
+                have_xr2 = true;
+            }
+            if (!have_xr2) {
+                int r2 = i;
+                while (r2 == i || r2 == r1 || r2 == pbest) {
+                    r2 = std::uniform_int_distribution<int>(0, pop_size - 1)(rng);
+                }
+                xr2 = population[static_cast<std::size_t>(r2)].x;
+            }
+
+            ParamVector base = population[static_cast<std::size_t>(i)].x;
+            if (coin(rng) < 0.18) {
+                if (auto donor = sample_archive_vector(official_archive, 8, rng); donor.has_value()) {
+                    base = *donor;
+                } else if (auto donor = sample_archive_vector(relaxed_archive, 10, rng); donor.has_value()) {
+                    base = *donor;
+                } else {
+                    base = population.front().x;
+                }
+            }
+
+            ParamVector mutant{};
+            if (coin(rng) < 0.80) {
+                for (int j = 0; j < kParamDim; ++j) {
+                    mutant[j] = population[static_cast<std::size_t>(i)].x[j]
+                        + f * (population[static_cast<std::size_t>(pbest)].x[j] - population[static_cast<std::size_t>(i)].x[j])
+                        + f * (population[static_cast<std::size_t>(r1)].x[j] - xr2[j]);
+                }
+            } else {
+                for (int j = 0; j < kParamDim; ++j) {
+                    mutant[j] = base[j] + f * (population[static_cast<std::size_t>(r1)].x[j] - xr2[j]);
+                }
+            }
+
+            ParamVector trial = population[static_cast<std::size_t>(i)].x;
+            const int jrand = std::uniform_int_distribution<int>(0, kParamDim - 1)(rng);
+            for (int j = 0; j < kParamDim; ++j) {
+                if (coin(rng) < cr || j == jrand) {
+                    trial[j] = mutant[j];
+                }
+            }
+            normalize_angles(trial);
+            if (((generation * pop_size) + i) % 3 == 0) {
+                center_by_mec(trial);
+            }
+
+            const ObjectiveSummary trial_summary = objective_value(trial, phase);
+            if (better_summary(trial_summary, population[static_cast<std::size_t>(i)].summary) ||
+                std::abs(trial_summary.cost - population[static_cast<std::size_t>(i)].summary.cost) <= 1e-12) {
+                if (archive.size() < archive_limit) {
+                    archive.push_back(population[static_cast<std::size_t>(i)].x);
+                } else if (!archive.empty()) {
+                    archive[static_cast<std::size_t>(
+                        std::uniform_int_distribution<int>(0, static_cast<int>(archive.size()) - 1)(rng)
+                    )] = population[static_cast<std::size_t>(i)].x;
+                }
+                population[static_cast<std::size_t>(i)] = {trial, trial_summary};
+                successful_f.push_back(f);
+                successful_cr.push_back(cr);
+            }
+        }
+
+        if (!successful_f.empty()) {
+            double num = 0.0;
+            double den = 0.0;
+            for (double f : successful_f) {
+                num += f * f;
+                den += f;
+            }
+            if (den > 0.0) {
+                mu_f = 0.90 * mu_f + 0.10 * (num / den);
+            }
+            const double mean_cr =
+                std::accumulate(successful_cr.begin(), successful_cr.end(), 0.0) /
+                static_cast<double>(successful_cr.size());
+            mu_cr = 0.90 * mu_cr + 0.10 * mean_cr;
+        }
+    }
+
+    if (population.empty()) {
+        return false;
+    }
+
+    sort_population();
+    bool inserted_any = false;
+    const int candidate_count = std::min<int>(3, static_cast<int>(population.size()));
+    for (int i = 0; i < candidate_count && !search_should_stop(deadline); ++i) {
+        ParamVector candidate_x = population[static_cast<std::size_t>(i)].x;
+        center_by_mec(candidate_x);
+        normalize_angles(candidate_x);
+        Layout candidate = to_layout(candidate_x);
+        if (i == 0) {
+            inserted_any = strict_refine_and_publish(
+                shared,
+                candidate,
+                thread_id,
+                StrategyId::IslandDE,
+                strategy_label,
+                strict_phases,
+                repair_phases,
+                deadline
+            ) || inserted_any;
+        }
+        if (population[static_cast<std::size_t>(i)].summary.min_margin >= relaxed_archive_phase.margin_target - 0.01) {
+            inserted_any = record_relaxed_then_repair(
+                shared,
+                candidate,
+                thread_id,
+                StrategyId::IslandDE,
+                strategy_label,
+                relaxed_archive_phase,
+                strict_phases,
+                repair_phases,
+                deadline
+            ) || inserted_any;
+        }
+    }
+
+    return inserted_any;
+}
+
+bool strict_refine_and_publish(
+    SharedBest& shared,
+    Layout seed_layout,
+    int thread_id,
+    StrategyId strategy_id,
+    const std::string& strategy_label,
+    const std::vector<ObjectivePhase>& phases,
+    const std::vector<ObjectivePhase>& repair_phases,
+    std::chrono::steady_clock::time_point deadline
 ) {
     ParamVector x = optimize_layout(to_vector(seed_layout), phases, deadline);
     Layout layout = to_layout(x);
@@ -3331,7 +3694,7 @@ void worker_loop(
                 repair_scaled,
                 deadline
             );
-        } else {
+        } else if (strategy == StrategyId::RelaxedWave) {
             Layout seed = choose_seed(rng, shared, base_seeds);
             std::vector<CandidateRecord> relaxed_archive = snapshot_relaxed_archive(shared);
             if (!relaxed_archive.empty()) {
@@ -3351,6 +3714,19 @@ void worker_loop(
                 relaxed_archive_phase,
                 strict_phases,
                 repair_scaled,
+                deadline
+            );
+        } else {
+            inserted_any = run_island_de_strategy(
+                shared,
+                thread_id,
+                strategy_label,
+                rng,
+                base_seeds,
+                relaxed_archive_phase,
+                strict_phases,
+                repair_scaled,
+                budget,
                 deadline
             );
         }
@@ -3374,13 +3750,12 @@ Options parse_args(int argc, char** argv) {
         const std::string arg = argv[i];
         if ((arg == "--seconds" || arg == "--search-seconds") && i + 1 < argc) {
             options.seconds = std::max(0.0, std::stod(argv[++i]));
-            if (options.seconds == 0.0) {
-                options.run_until_interrupt = true;
-            }
+            options.run_until_interrupt = (options.seconds == 0.0);
         } else if (arg == "--threads" && i + 1 < argc) {
             options.threads = std::max(1, std::stoi(argv[++i]));
         } else if (arg == "--forever" || arg == "--until-interrupt") {
             options.run_until_interrupt = true;
+            options.seconds = 0.0;
         } else if (arg == "--checkpoint-seconds" && i + 1 < argc) {
             options.checkpoint_seconds = std::max(1, std::stoi(argv[++i]));
         } else if (arg == "--archive-size" && i + 1 < argc) {
@@ -3399,7 +3774,8 @@ Options parse_args(int argc, char** argv) {
             std::cout
                 << "Usage: ./solve [--seconds N | --forever] [--threads N] [--checkpoint-seconds N]"
                 << " [--archive-size N] [--relaxed-archive-size N] [--no-resume]"
-                << " [--input FILE] [--output FILE] [--strategy-log FILE]\n";
+                << " [--input FILE] [--output FILE] [--strategy-log FILE]\n"
+                << "Defaults: auto thread count, run until Ctrl+C, checkpoint every 300s.\n";
             std::exit(0);
         } else {
             throw std::runtime_error("Unknown argument: " + arg);
