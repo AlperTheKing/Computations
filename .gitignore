@@ -1,0 +1,16 @@
+collatz100B.exe
+Collatz100BCuda.exe
+Collatz100BCuda.exp
+Collatz100BCuda.lib
+prime_y_1891.png
+alper.py
+alper.cpp
+alper2.cpp
+chess_oa/.pytest_cache/
+chess_oa/.venv/
+chess_oa/artifacts/
+chess_oa/build/
+chess_oa/checkpoints/
+chess_oa/data/
+chess_oa/logs/
+chess_oa/vendor/
